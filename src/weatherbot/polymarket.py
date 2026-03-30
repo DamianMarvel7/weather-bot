@@ -158,11 +158,13 @@ def get_polymarket_event(city_slug: str, date_str: str) -> dict | None:
         bid, ask = None, None
         if token_id:
             bid, ask = get_clob_prices(token_id)
-        if ask is None:
+        # Only fall back to outcomePrices for bid display — never use it as ask
+        # (outcomePrices is stale AMM data and bypasses the min_price filter)
+        if bid is None:
             raw_prices = child.get("outcomePrices", "[]")
             try:
                 prices = json.loads(raw_prices) if isinstance(raw_prices, str) else raw_prices
-                ask = bid = float(prices[0]) if prices else None
+                bid = float(prices[0]) if prices else None
             except Exception:
                 pass
 
@@ -170,13 +172,14 @@ def get_polymarket_event(city_slug: str, date_str: str) -> dict | None:
         total_volume += vol
 
         outcomes.append({
-            "label":    label,
-            "lo":       lo,
-            "hi":       hi,
-            "bid":      bid,
-            "ask":      ask,
-            "token_id": token_id,
-            "volume":   vol,
+            "label":     label,
+            "lo":        lo,
+            "hi":        hi,
+            "bid":       bid,
+            "ask":       ask,
+            "token_id":  token_id,
+            "market_id": child.get("id"),
+            "volume":    vol,
         })
 
     if total_volume < MIN_VOLUME:
@@ -189,3 +192,91 @@ def get_polymarket_event(city_slug: str, date_str: str) -> dict | None:
         "volume":     total_volume,
         "outcomes":   outcomes,
     }
+
+
+def get_polymarket_historical_resolved(city_slug: str, date_str: str) -> tuple[str | None, float | None]:
+    """
+    Fetch the winning bucket label and representative temp for a closed Polymarket event.
+
+    Paginates through closed temperature events until the city+date match is found.
+    Returns (label, midpoint) or (None, None) if not found / not yet settled.
+
+    Midpoint rules:
+      - exact bucket "13°C" (lo=12.5, hi=13.5) → 13.0
+      - tail "33°C or below"                    → 33.0 (use the bound)
+      - tail "58°F or higher"                   → 58.0 (use the bound)
+    """
+    city_name = LOCATIONS[city_slug]["name"]
+    dt        = datetime.strptime(date_str, "%Y-%m-%d")
+    date_frag = f"{dt.strftime('%B')} {dt.day}"  # e.g. "March 25"
+
+    offset = 0
+    while True:
+        events = _gamma_get("/events", params={
+            "closed":    "true",
+            "tag_slug":  "temperature",
+            "limit":     200,
+            "offset":    offset,
+            "order":     "createdAt",
+            "ascending": "false",
+        })
+        if not events:
+            break
+
+        for ev in events:
+            title = ev.get("title", "")
+            if city_name.lower() not in title.lower():
+                continue
+            if date_frag not in title:
+                continue
+            # Found matching event — find the winning child market
+            for child in ev.get("markets", []):
+                raw = child.get("outcomePrices", "[]")
+                try:
+                    prices    = json.loads(raw) if isinstance(raw, str) else raw
+                    yes_price = float(prices[0]) if prices else 0.5
+                except Exception:
+                    continue
+                if yes_price >= 0.95:
+                    question = child.get("question", "")
+                    m_q      = re.search(r"\bbe\s+(.+?)\s+on\s+\w+\s+\d+", question, re.I)
+                    label    = m_q.group(1) if m_q else question
+                    lo, hi   = parse_bucket_bounds(label)
+                    if lo <= -900:
+                        midpoint = hi        # "X or below" → use X
+                    elif hi >= 900:
+                        midpoint = lo        # "X or above" → use X
+                    else:
+                        midpoint = (lo + hi) / 2
+                    return label, midpoint
+            return None, None  # event found but no winner settled yet
+
+        if len(events) < 200:
+            break
+        offset += 200
+
+    return None, None
+
+
+def check_gamma_resolved(market_id: str) -> bool | None:
+    """
+    Check if a child market has been officially settled on Polymarket via Gamma API.
+
+    Returns True  → YES outcome won (outcomePrices[0] >= 0.95)
+            False → NO outcome won  (outcomePrices[0] <= 0.05)
+            None  → market not closed or outcome unclear
+    """
+    data = _gamma_get(f"/markets/{market_id}")
+    if not data or not data.get("closed", False):
+        return None
+    raw = data.get("outcomePrices", "[]")
+    try:
+        prices = json.loads(raw) if isinstance(raw, str) else raw
+        yes_price = float(prices[0]) if prices else 0.5
+    except Exception:
+        return None
+    if yes_price >= 0.95:
+        return True
+    if yes_price <= 0.05:
+        return False
+    return None

@@ -22,6 +22,7 @@ from .portfolio import load_market, save_market, run_calibration, _now_iso  # no
 
 from .bot import WeatherBot
 from .portfolio import _now_iso
+from .telegram_bot import load_from_config, notify_scan_done
 
 
 def main() -> None:
@@ -29,11 +30,23 @@ def main() -> None:
 
     bot = WeatherBot()
 
+    # Attach Telegram notifier if token is configured in config.json
+    tg = load_from_config()
+    if tg:
+        tg.set_bot(bot)
+        bot.tg = tg
+        tg.start_polling()
+    else:
+        print("[Telegram] Not configured — add telegram_token + telegram_chat_id to config.json to enable.")
+
     if arg == "status":
         bot.cmd_status()
         return
     if arg == "report":
         bot.cmd_report()
+        return
+    if arg == "edge":
+        bot.cmd_edge()
         return
 
     print("Polymarket Weather Bot starting…")
@@ -53,8 +66,12 @@ def main() -> None:
         print(f"[{_now_iso()}] Running full scan…")
         try:
             bot.scan_and_update()
+            if tg:
+                notify_scan_done(tg, bot, len(LOCATIONS))
         except Exception as exc:
             print(f"Scan error: {exc}")
+            if tg:
+                tg.send(f"⚠️ <b>Scan error:</b> {exc}")
         print(f"[{_now_iso()}] Scan complete. Sleeping {SCAN_INTERVAL}s.\n")
         time.sleep(SCAN_INTERVAL)
 

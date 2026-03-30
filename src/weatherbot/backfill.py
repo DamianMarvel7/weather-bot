@@ -21,6 +21,7 @@ Usage:
 import argparse
 import os
 import sys
+import time
 import requests
 from datetime import datetime, timedelta, timezone
 
@@ -37,6 +38,7 @@ from src.weatherbot.weatherbet import (
     run_calibration,
     _now_iso,
 )
+from src.weatherbot.polymarket import get_polymarket_historical_resolved
 
 # ---------------------------------------------------------------------------
 # ERA5 reanalysis archive — free, no key, goes back to 1940
@@ -102,22 +104,24 @@ def get_actual_temps_vc_bulk(city_slug: str, start: str, end: str) -> dict:
 
 def build_synthetic_market(city_slug: str, date_str: str,
                             forecast_temp: float | None,
-                            actual_temp: float | None) -> dict:
+                            actual_temp: float | None,
+                            actual_temp_source: str = "era5") -> dict:
     """
     Resolved market record with one forecast snapshot.
     forecast_temp = ERA5[D-1] — proxy for a D+1 prediction.
     actual_temp   = ERA5[D] or Visual Crossing[D].
     """
     return {
-        "city":             city_slug,
-        "city_name":        LOCATIONS[city_slug]["name"],
-        "date":             date_str,
-        "event":            f"[backfill] {LOCATIONS[city_slug]['name']} {date_str}",
-        "status":           "resolved",
-        "position":         None,
-        "actual_temp":      actual_temp,
-        "resolved_outcome": None,
-        "pnl":              None,
+        "city":               city_slug,
+        "city_name":          LOCATIONS[city_slug]["name"],
+        "date":               date_str,
+        "event":              f"[backfill] {LOCATIONS[city_slug]['name']} {date_str}",
+        "status":             "resolved",
+        "position":           None,
+        "actual_temp":        actual_temp,
+        "actual_temp_source": actual_temp_source,
+        "resolved_outcome":   None,
+        "pnl":                None,
         "forecast_snapshots": [
             {
                 "ts":          date_str + "T00:00:00Z",
@@ -141,7 +145,7 @@ def build_synthetic_market(city_slug: str, date_str: str,
 # Main
 # ---------------------------------------------------------------------------
 
-def backfill(days: int = 90) -> None:
+def backfill(days: int = 90, use_polymarket: bool = False) -> None:
     today    = datetime.now(timezone.utc).date()
     end_date = (today - timedelta(days=1)).isoformat()
     # Fetch one extra day at the start so we have ERA5[D-1] for every target date
@@ -149,13 +153,14 @@ def backfill(days: int = 90) -> None:
     start_date_minus1 = (today - timedelta(days=days + 1)).isoformat()
 
     print(f"Backfilling {start_date} → {end_date} ({days} days, {len(LOCATIONS)} cities)")
-    print("Source: ERA5 reanalysis archive (free) — no API key required\n")
 
     has_vc = bool(VC_KEY and VC_KEY != "YOUR_KEY_HERE")
-    if has_vc:
-        print("Visual Crossing key found — using station actuals for actual_temp.\n")
+    if use_polymarket:
+        print("Mode: Polymarket resolved winners (primary) → VC → ERA5 fallback\n")
+    elif has_vc:
+        print("Mode: Visual Crossing station actuals → ERA5 fallback\n")
     else:
-        print("No vc_key set — using ERA5 for actual_temp (still useful for calibration).\n")
+        print("Mode: ERA5 reanalysis archive (no API key)\n")
 
     new_total  = 0
     skip_total = 0
@@ -165,10 +170,13 @@ def backfill(days: int = 90) -> None:
 
         # One bulk ERA5 call covers start-1 through end (for the D-1 proxy)
         era5_map   = get_era5_bulk(city_slug, start_date_minus1, end_date)
+        if has_vc:
+            time.sleep(1)
         actual_map = get_actual_temps_vc_bulk(city_slug, start_date, end_date) \
                      if has_vc else {}
 
-        city_new = 0
+        city_new      = 0
+        source_counts = {"polymarket": 0, "vc": 0, "era5": 0}
         current  = datetime.strptime(start_date, "%Y-%m-%d").date()
         end_dt   = datetime.strptime(end_date, "%Y-%m-%d").date()
 
@@ -178,29 +186,56 @@ def backfill(days: int = 90) -> None:
             current    += timedelta(days=1)
 
             existing = load_market(city_slug, date_str)
-            # Skip if already has a real actual_temp (not a backfill placeholder)
-            if existing is not None and existing.get("actual_temp") is not None \
-                    and not existing.get("backfilled"):
-                skip_total += 1
-                continue
-            # Re-write backfilled records that still have null actual_temp
-            if existing is not None and existing.get("actual_temp") is not None \
-                    and VC_KEY in ("YOUR_KEY_HERE", ""):
-                skip_total += 1
-                continue
+            if existing is not None:
+                # Always skip real (non-backfilled) records
+                if not existing.get("backfilled"):
+                    skip_total += 1
+                    continue
+                # Skip if already have Polymarket-sourced actuals (highest quality)
+                if existing.get("actual_temp_source") == "polymarket":
+                    skip_total += 1
+                    continue
+                # Skip VC records unless upgrading to Polymarket
+                if existing.get("actual_temp_source") == "vc" and not use_polymarket:
+                    skip_total += 1
+                    continue
+                # Skip ERA5-only records if we have no upgrade available
+                if existing.get("actual_temp") is not None and not has_vc and not use_polymarket:
+                    skip_total += 1
+                    continue
 
             forecast_temp = era5_map.get(prev_date)   # ERA5[D-1] as forecast proxy
-            actual_temp   = actual_map.get(date_str) or era5_map.get(date_str)
+
+            # Determine actual_temp — priority: Polymarket winner → VC → ERA5
+            actual_temp   = None
+            actual_source = "era5"
+            pm_label      = None
+
+            if use_polymarket:
+                pm_label, pm_temp = get_polymarket_historical_resolved(city_slug, date_str)
+                if pm_temp is not None:
+                    actual_temp   = pm_temp
+                    actual_source = "polymarket"
+                    time.sleep(0.3)  # be gentle with the API
+
+            if actual_temp is None:
+                vc_temp     = actual_map.get(date_str)
+                actual_temp = vc_temp or era5_map.get(date_str)
+                actual_source = "vc" if vc_temp is not None else "era5"
 
             if forecast_temp is None and actual_temp is None:
                 continue
 
-            mkt = build_synthetic_market(city_slug, date_str, forecast_temp, actual_temp)
+            mkt = build_synthetic_market(city_slug, date_str, forecast_temp, actual_temp, actual_source)
+            if pm_label:
+                mkt["resolved_outcome"] = pm_label
             save_market(mkt)
             city_new  += 1
             new_total += 1
+            source_counts[actual_source] = source_counts.get(actual_source, 0) + 1
 
-        print(f"{city_new} records")
+        parts = [f"{source_counts[s]} {s}" for s in ("polymarket", "vc", "era5") if source_counts[s] > 0]
+        print(f"{city_new} records  ({', '.join(parts)})")
 
     print(f"\nBackfill complete — {new_total} new records, {skip_total} already existed.")
     print("\nRunning calibration…")
@@ -225,5 +260,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--days", type=int, default=90,
                         help="Days to backfill (default: 90)")
+    parser.add_argument("--polymarket", action="store_true",
+                        help="Use Polymarket resolved winners as actual_temp (best for calibration)")
     args = parser.parse_args()
-    backfill(args.days)
+    backfill(args.days, use_polymarket=args.polymarket)

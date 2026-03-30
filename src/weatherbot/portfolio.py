@@ -126,36 +126,79 @@ def append_market_snapshot(market: dict, hours_left: float,
 # Calibration
 # ---------------------------------------------------------------------------
 
+def _resolved_temp_estimate(mkt: dict) -> float | None:
+    """
+    Return best available actual temperature for a resolved market.
+
+    Priority:
+      1. Polymarket resolved_outcome midpoint — the source Polymarket itself used,
+         so calibration trains against the right target.
+      2. VC/ERA5 actual_temp — fallback when resolved_outcome is absent or a tail bucket.
+
+    Tail buckets ("X or below" / "X or above") are skipped for midpoint because the
+    true value is unknown; actual_temp is used instead when available.
+    """
+    label = mkt.get("resolved_outcome")
+    if label:
+        lo, hi = parse_bucket_bounds(label)
+        # Use midpoint for non-tail, narrow buckets (width ≤ 3 units)
+        if lo > -999 and hi < 999 and (hi - lo) <= 3:
+            return (lo + hi) / 2
+    # Fall back to VC/ERA5 actual_temp
+    actual = mkt.get("actual_temp")
+    if actual is not None:
+        return actual
+    # Last resort: tail bucket bound (better than nothing)
+    if label:
+        lo, hi = parse_bucket_bounds(label)
+        if lo <= -999:
+            return hi
+        if hi >= 999:
+            return lo
+    return None
+
+
 def run_calibration() -> dict:
     """
-    Compute MAE per (city, source) from resolved markets with actual_temp.
-    Saves to data/calibration.json and returns the calibration dict.
+    Compute MAE and BIAS per (city, source) from resolved markets.
+
+    bias = mean(forecast − actual): positive → model runs warm, negative → model runs cold.
+    Bias is used in get_probability() to shift the forecast before computing bucket probability,
+    directly correcting systematic station offsets.
+
+    Falls back to resolved bucket midpoint when VC actual_temp is unavailable.
     """
     all_markets = []
     for path in glob.glob(os.path.join(DATA_DIR, "*.json")):
         with open(path) as f:
             all_markets.append(json.load(f))
 
-    resolved = [m for m in all_markets
-                if m.get("status") == "resolved" and m.get("actual_temp") is not None]
+    resolved = [m for m in all_markets if m.get("status") == "resolved"]
 
     calib: dict[str, dict] = {}
     for source in ("ecmwf", "hrrr"):
         for city_slug in LOCATIONS:
             city_markets = [m for m in resolved if m["city"] == city_slug]
-            errors = []
+            abs_errors: list[float] = []
+            signed_errors: list[float] = []
             for mkt in city_markets:
-                actual = mkt["actual_temp"]
-                snaps = [s for s in mkt["forecast_snapshots"] if s.get(source) is not None]
+                actual = _resolved_temp_estimate(mkt)
+                if actual is None:
+                    continue
+                snaps = [s for s in mkt.get("forecast_snapshots", [])
+                         if s.get(source) is not None]
                 if not snaps:
                     continue
                 closest = min(snaps, key=lambda s: s["hours_left"])
-                errors.append(abs(closest[source] - actual))
+                err = closest[source] - actual   # positive = model ran warm
+                abs_errors.append(abs(err))
+                signed_errors.append(err)
 
-            if len(errors) >= CALIBRATION_MIN:
+            if len(abs_errors) >= CALIBRATION_MIN:
                 calib[f"{city_slug}_{source}"] = {
-                    "mae": round(sum(errors) / len(errors), 3),
-                    "n":   len(errors),
+                    "mae":  round(sum(abs_errors) / len(abs_errors), 3),
+                    "bias": round(sum(signed_errors) / len(signed_errors), 3),
+                    "n":    len(abs_errors),
                 }
 
     os.makedirs(os.path.dirname(CALIBRATION_PATH), exist_ok=True)
@@ -174,12 +217,21 @@ def load_calibration() -> dict:
 
 def get_probability(city_slug: str, bucket_lo: float, bucket_hi: float,
                     forecast_temp: float, best_source: str, calibration: dict) -> float:
-    """P(actual in bucket) using calibrated normal distribution."""
+    """
+    P(actual in bucket) using a bias-corrected, calibrated normal distribution.
+
+    sigma default: 5°F / 2.5°C — based on published ECMWF 48h max-temp MAE.
+    bias correction: subtracts the model's historical systematic offset from the
+    forecast before computing bucket probability (e.g. if the model runs 2°C warm
+    at this station, the corrected forecast is shifted 2°C cooler).
+    """
     unit    = LOCATIONS[city_slug]["unit"]
-    default = 3.0 if unit == "F" else 1.5
+    default = 5.0 if unit == "F" else 2.5
     entry   = calibration.get(f"{city_slug}_{best_source}")
-    sigma   = entry["mae"] if entry else default
-    return _bucket_probability(bucket_lo, bucket_hi, forecast_temp, sigma)
+    sigma   = entry["mae"]  if entry else default
+    bias    = entry["bias"] if entry else 0.0
+    corrected_temp = forecast_temp - bias
+    return _bucket_probability(bucket_lo, bucket_hi, corrected_temp, sigma)
 
 # ---------------------------------------------------------------------------
 # BotState — owns balance and all position mutations

@@ -11,10 +11,10 @@ import requests
 
 from .config import (
     DATA_DIR, LOCATIONS, VC_KEY,
-    MAX_BET, MIN_EV, MIN_PRICE, MAX_PRICE, MAX_SLIPPAGE,
+    MAX_BET, MIN_EV, MAX_EV, MIN_PRICE, MAX_PRICE, MAX_SLIPPAGE, MAX_POSITIONS,
 )
 from .forecast import get_best_forecast
-from .polymarket import get_polymarket_event, get_clob_prices
+from .polymarket import get_polymarket_event, get_clob_prices, check_gamma_resolved
 from .portfolio import (
     BotState,
     load_market, save_market, new_market,
@@ -38,6 +38,7 @@ class WeatherBot:
     def __init__(self) -> None:
         self.state       = BotState.load()
         self.calibration = load_calibration()
+        self.tg          = None   # TelegramNotifier — set by weatherbet.py if configured
 
     # ------------------------------------------------------------------
     # Public entry points
@@ -79,8 +80,12 @@ class WeatherBot:
                 continue
             stop = BotState.check_stops(mkt, cur_bid, None)
             if stop:
+                pos = mkt.get("position", {})
                 self.state.close_position(mkt, cur_bid, stop)
                 save_market(mkt)
+                if self.tg:
+                    from .telegram_bot import notify_closed
+                    notify_closed(self.tg, mkt, pos, stop, cur_bid)
         self.state.save()
 
     # ------------------------------------------------------------------
@@ -124,15 +129,109 @@ class WeatherBot:
 
         print(f"\nResolved markets: {len(rows)}  W/L: {wins}/{losses}  "
               f"Total P&L: ${total_pnl:+.2f}\n")
-        print(f"{'City':<14} {'Date':<12} {'Bucket':<20} {'Actual':>8} {'P&L':>8}  Reason")
-        print("-" * 80)
+        print(f"{'City':<14} {'Date':<12} {'Our Bucket':<20} {'PM Resolved':<20} {'VC Actual':>10} {'P&L':>8}  Reason")
+        print("-" * 100)
         for r in rows:
-            pos    = r.get("position", {}) or {}
-            bucket = pos.get("bucket", r.get("resolved_outcome", "-"))
-            actual = f"{r['actual_temp']:.1f}" if r.get("actual_temp") else "-"
-            reason = pos.get("close_reason", "-")
-            print(f"{r['city']:<14} {r['date']:<12} {bucket:<20} {actual:>8} "
+            pos        = r.get("position", {}) or {}
+            bucket     = pos.get("bucket", "-")
+            pm_resolved = r.get("resolved_outcome", "-")
+            actual     = f"{r['actual_temp']:.1f}" if r.get("actual_temp") else "-"
+            reason     = pos.get("close_reason", "-")
+            print(f"{r['city']:<14} {r['date']:<12} {bucket:<20} {pm_resolved:<20} {actual:>10} "
                   f"${r['pnl']:>+7.2f}  {reason}")
+        print()
+
+    @staticmethod
+    def cmd_edge() -> None:
+        """
+        Model edge report: checks whether estimated EV predicts actual returns.
+        Includes EV calibration, probability calibration, and breakdown by city
+        and close reason.
+        """
+        rows = []
+        for path in glob.glob(os.path.join(DATA_DIR, "*.json")):
+            with open(path) as f:
+                mkt = json.load(f)
+            pos = mkt.get("position")
+            if not pos or pos.get("close_reason") is None or mkt.get("pnl") is None:
+                continue
+            ev  = pos.get("ev", 0.0)
+            ask = pos.get("entry_ask", 0.5)
+            # p back-calculated from ev = p/ask - 1  →  p = (ev + 1) * ask
+            p_est = min(max((ev + 1) * ask, 0.0), 1.0)
+            rows.append({
+                "city":         mkt["city"],
+                "ev":           ev,
+                "p_est":        p_est,
+                "ask":          ask,
+                "pnl":          mkt["pnl"],
+                "size":         pos.get("size", 0.0),
+                "won":          mkt["pnl"] > 0,
+                "close_reason": pos.get("close_reason", "-"),
+            })
+
+        if not rows:
+            print("No closed positions yet.")
+            return
+
+        def _table(section_rows: list[dict], buckets: list[tuple],
+                   labels: list[str], key: str, header: str) -> None:
+            print(f"\n--- {header} ({len(section_rows)} trades) ---")
+            print(f"{'Bucket':<14} {'N':>5} {'Win%':>6} {'Mean PnL':>10} {'Mean EV':>9} {'Total PnL':>10}")
+            print("-" * 58)
+            for (lo, hi), label in zip(buckets, labels):
+                br = [r for r in section_rows if lo <= r[key] < hi]
+                if not br:
+                    continue
+                n         = len(br)
+                win_pct   = 100 * sum(r["won"] for r in br) / n
+                mean_pnl  = sum(r["pnl"] for r in br) / n
+                mean_ev   = 100 * sum(r["ev"] for r in br) / n
+                total_pnl = sum(r["pnl"] for r in br)
+                print(f"{label:<14} {n:>5} {win_pct:>5.0f}% {mean_pnl:>+9.2f}  {mean_ev:>7.1f}% {total_pnl:>+9.2f}")
+
+        # EV calibration
+        _table(rows,
+               [(0.0, 0.05), (0.05, 0.10), (0.10, 0.20), (0.20, 1.0)],
+               ["0–5%", "5–10%", "10–20%", "20%+"],
+               "ev", "EV Calibration")
+
+        # Probability calibration
+        print(f"\n--- Probability Calibration ---")
+        p_buckets = [(0.0, 0.5), (0.5, 0.6), (0.6, 0.7), (0.7, 0.8), (0.8, 1.0)]
+        p_labels  = ["<50%", "50–60%", "60–70%", "70–80%", "80%+"]
+        print(f"{'Est. P':<10} {'N':>5} {'Actual win%':>12} {'Expected':>10}")
+        print("-" * 42)
+        for (lo, hi), label in zip(p_buckets, p_labels):
+            br = [r for r in rows if lo <= r["p_est"] < hi]
+            if not br:
+                continue
+            n           = len(br)
+            actual_win  = 100 * sum(r["won"] for r in br) / n
+            expected    = 100 * sum(r["p_est"] for r in br) / n
+            print(f"{label:<10} {n:>5} {actual_win:>11.0f}% {expected:>9.0f}%")
+
+        # By city
+        print(f"\n--- Edge by City ---")
+        print(f"{'City':<16} {'N':>5} {'Win%':>6} {'Total PnL':>10}")
+        print("-" * 40)
+        for city in sorted(set(r["city"] for r in rows)):
+            br        = [r for r in rows if r["city"] == city]
+            n         = len(br)
+            win_pct   = 100 * sum(r["won"] for r in br) / n
+            total_pnl = sum(r["pnl"] for r in br)
+            print(f"{city:<16} {n:>5} {win_pct:>5.0f}% {total_pnl:>+9.2f}")
+
+        # By close reason
+        print(f"\n--- Edge by Close Reason ---")
+        print(f"{'Reason':<18} {'N':>5} {'Win%':>6} {'Total PnL':>10}")
+        print("-" * 42)
+        for reason in sorted(set(r["close_reason"] for r in rows)):
+            br        = [r for r in rows if r["close_reason"] == reason]
+            n         = len(br)
+            win_pct   = 100 * sum(r["won"] for r in br) / n
+            total_pnl = sum(r["pnl"] for r in br)
+            print(f"{reason:<18} {n:>5} {win_pct:>5.0f}% {total_pnl:>+9.2f}")
         print()
 
     # ------------------------------------------------------------------
@@ -160,12 +259,19 @@ class WeatherBot:
     def _auto_resolve(self, market: dict) -> bool:
         """
         Check Polymarket for resolution. Returns True if resolved.
-        YES price ≥ 0.95 → outcome WON; YES price ≤ 0.05 → outcome LOST.
+
+        Strategy (in order):
+        1. CLOB orderbook: YES mid price ≥ 0.95 → that bucket won.
+        2. Gamma API fallback: if CLOB is inconclusive, check each child
+           market's `closed` flag + `outcomePrices`. This handles markets
+           that have passed their end date but haven't settled CLOB prices yet.
         """
         if market["status"] != "open":
             return False
 
         resolved_bucket = None
+
+        # --- Pass 1: CLOB orderbook prices ---
         for outcome in market.get("all_outcomes", []):
             token_id = outcome.get("token_id")
             if not token_id:
@@ -178,6 +284,24 @@ class WeatherBot:
                 resolved_bucket = outcome["label"]
                 break
 
+        # --- Pass 2: Gamma API closed flag (handles post-deadline markets) ---
+        if resolved_bucket is None:
+            for outcome in market.get("all_outcomes", []):
+                market_id = outcome.get("market_id")
+                if not market_id:
+                    continue
+                won = check_gamma_resolved(str(market_id))
+                if won is True:
+                    resolved_bucket = outcome["label"]
+                    break
+
+        # --- Pass 3: Historical closed events search (fallback when market_id missing) ---
+        if resolved_bucket is None:
+            from .polymarket import get_polymarket_historical_resolved
+            label, _ = get_polymarket_historical_resolved(market["city"], market["date"])
+            if label:
+                resolved_bucket = label
+
         if resolved_bucket is None:
             return False
 
@@ -189,6 +313,9 @@ class WeatherBot:
         if pos and pos.get("close_reason") is None:
             final_bid = 0.99 if resolved_bucket == pos["bucket"] else 0.01
             self.state.close_position(market, final_bid, "resolved")
+            if self.tg:
+                from .telegram_bot import notify_closed
+                notify_closed(self.tg, market, pos, "resolved", final_bid)
 
         print(f"  RESOLVED {market['city']} {market['date']} → {resolved_bucket} "
               f"actual={market['actual_temp']}")
@@ -236,15 +363,33 @@ class WeatherBot:
                 stop = BotState.check_stops(mkt, cur_bid, forecast["best"])
                 if stop:
                     self.state.close_position(mkt, cur_bid, stop)
+                    if self.tg:
+                        from .telegram_bot import notify_closed
+                        notify_closed(self.tg, mkt, pos, stop, cur_bid)
 
         if mkt.get("position") is None or mkt["position"].get("close_reason") is not None:
             self._maybe_open(mkt, event, forecast, hours_left)
 
         save_market(mkt)
 
+    def _count_open_positions(self) -> int:
+        """Count currently open positions across all market files."""
+        count = 0
+        for path in glob.glob(os.path.join(DATA_DIR, "*.json")):
+            with open(path) as f:
+                mkt = json.load(f)
+            pos = mkt.get("position")
+            if pos and pos.get("close_reason") is None and mkt.get("status") == "open":
+                count += 1
+        return count
+
     def _maybe_open(self, market: dict, event: dict, forecast: dict,
                     hours_left: float) -> None:
         """Evaluate all buckets and open the best-EV position if it clears thresholds."""
+        # Don't open more positions than the configured maximum
+        if self._count_open_positions() >= MAX_POSITIONS:
+            return
+
         city_slug   = market["city"]
         temp        = forecast["best"]
         best_source = forecast["best_source"] or "ecmwf"
@@ -256,6 +401,7 @@ class WeatherBot:
         for outcome in event["outcomes"]:
             ask = outcome.get("ask")
             bid = outcome.get("bid")
+            # Require a real CLOB ask — skip if no live ask price
             if ask is None or ask < MIN_PRICE or ask >= MAX_PRICE:
                 continue
             if bid is not None and (ask - bid) > MAX_SLIPPAGE:
@@ -263,8 +409,13 @@ class WeatherBot:
 
             p  = get_probability(city_slug, outcome["lo"], outcome["hi"],
                                  temp, best_source, self.calibration)
+            # Skip buckets our model considers very unlikely regardless of ask price.
+            # Protects against buying 1-cent lottery tickets the model barely believes in.
+            if p < 0.05:
+                continue
             ev = calc_ev(p, ask)
-            if ev > best_ev:
+            # Cap EV — anything above MAX_EV is likely a model artifact from tiny prices
+            if ev > best_ev and ev <= MAX_EV:
                 best_ev, best_out, best_p = ev, outcome, p
 
         if best_out is None:
@@ -276,3 +427,6 @@ class WeatherBot:
             return
 
         self.state.open_position(market, best_out, size_dollars, best_ev, kelly_frac)
+        if self.tg:
+            from .telegram_bot import notify_opened
+            notify_opened(self.tg, market, market["position"])
