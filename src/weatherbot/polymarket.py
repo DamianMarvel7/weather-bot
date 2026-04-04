@@ -27,14 +27,15 @@ def get_clob_prices(clob_token_id: str) -> tuple[float | None, float | None]:
     We enter at ask, monitor/exit at bid — honest simulation.
     """
     try:
-        resp = requests.get(f"{CLOB_API}/books",
+        resp = requests.get(f"{CLOB_API}/book",
                             params={"token_id": clob_token_id}, timeout=(5, 8))
         resp.raise_for_status()
         book = resp.json()
         bids = book.get("bids", [])
         asks = book.get("asks", [])
-        best_bid = float(bids[0]["price"]) if bids else None
-        best_ask = float(asks[0]["price"]) if asks else None
+        # /book returns bids ascending, asks descending — best prices are at the end
+        best_bid = float(bids[-1]["price"]) if bids else None
+        best_ask = float(asks[-1]["price"]) if asks else None
         return best_bid, best_ask
     except Exception:
         return None, None

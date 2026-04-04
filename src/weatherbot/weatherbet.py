@@ -43,10 +43,21 @@ def main() -> None:
         bot.cmd_status()
         return
     if arg == "report":
-        bot.cmd_report()
+        last_n = None
+        if "--last" in sys.argv:
+            idx = sys.argv.index("--last")
+            try:
+                last_n = int(sys.argv[idx + 1])
+            except (IndexError, ValueError):
+                print("Usage: report --last N")
+                return
+        bot.cmd_report(last_n=last_n)
         return
     if arg == "edge":
         bot.cmd_edge()
+        return
+    if arg == "scan":
+        bot.cmd_scan_dry()
         return
 
     print("Polymarket Weather Bot starting…")

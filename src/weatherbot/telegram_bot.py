@@ -238,8 +238,10 @@ def notify_opened(tg: TelegramNotifier, market: dict, pos: dict) -> None:
     src   = snaps[-1].get("best_source", "") if snaps else ""
     fc_str = f"{fc:.1f}° ({src})" if fc is not None else "—"
 
+    opened_at = pos.get("opened_at", "")
     tg.send(
         f"🟢 <b>POSITION OPENED</b>\n"
+        f"🕐 {opened_at}\n"
         f"📍 {city} · {date}\n"
         f"🎯 Bucket: <b>{pos.get('bucket','?')}</b>\n"
         f"🌡 Forecast: {fc_str}\n"
@@ -277,20 +279,27 @@ def notify_closed(tg: TelegramNotifier, market: dict, pos: dict,
         vc_str      = f"{vc_actual:.1f}°" if vc_actual is not None else "?"
         extra = f"\n🏆 PM resolved: <b>{pm_resolved}</b>\n🌡 VC actual: <b>{vc_str}</b>"
 
+    closed_at  = pos.get("closed_at", "")
+    opened_at  = pos.get("opened_at", "")
     tg.send(
         f"{icon} <b>POSITION CLOSED</b>\n"
+        f"🕐 {closed_at}\n"
         f"📍 {city} · {date}\n"
         f"🎯 Our bucket: <b>{pos.get('bucket','?')}</b>{extra}\n"
         f"📌 Reason: {reason_str}\n"
         f"💵 Entry: {entry:.3f}  →  Exit: {exit_bid:.3f}\n"
+        f"📅 Opened: {opened_at}\n"
         f"💰 P&amp;L: <b>${pnl:+.2f}</b>"
     )
 
 
 def notify_scan_done(tg: TelegramNotifier, bot, n_cities: int) -> None:
-    bal   = bot.state.balance
+    from datetime import datetime, timezone
+    bal      = bot.state.balance
+    scan_ts  = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     tg.send(
         f"🔄 <b>Scan complete</b>\n"
+        f"🕐 {scan_ts}\n"
         f"📡 Checked {n_cities} cities\n"
         f"💰 Balance: ${bal:,.2f}"
     )

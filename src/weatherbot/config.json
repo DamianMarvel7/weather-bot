@@ -1,16 +1,18 @@
 {
   "balance": 10000.0,
   "max_bet": 20.0,
-  "min_ev": 0.05,
+  "min_ev": 0.10,
   "max_price": 0.45,
   "min_price": 0.05,
   "min_volume": 2000,
-  "min_hours": 2.0,
+  "min_hours": 6.0,
   "max_hours": 72.0,
   "kelly_fraction": 0.25,
   "max_slippage": 0.03,
   "scan_interval": 3600,
   "calibration_min": 15,
   "max_ev": 1.5,
-  "max_positions": 10
+  "max_positions": 10,
+  "sigma_multiplier": 1.8,
+  "bias_scale": 1.0
 }

@@ -7,12 +7,13 @@ import glob
 import json
 import math
 import os
+
 from datetime import datetime, timezone
 
 from .config import (
     DATA_DIR, CALIBRATION_PATH, STATE_PATH,
     INITIAL_BALANCE, KELLY_FRACTION, CALIBRATION_MIN,
-    LOCATIONS,
+    LOCATIONS, SIGMA_MULTIPLIER, BIAS_SCALE,
 )
 from .polymarket import parse_bucket_bounds
 
@@ -148,7 +149,6 @@ def _resolved_temp_estimate(mkt: dict) -> float | None:
     actual = mkt.get("actual_temp")
     if actual is not None:
         return actual
-    # Last resort: tail bucket bound (better than nothing)
     if label:
         lo, hi = parse_bucket_bounds(label)
         if lo <= -999:
@@ -227,9 +227,9 @@ def get_probability(city_slug: str, bucket_lo: float, bucket_hi: float,
     """
     unit    = LOCATIONS[city_slug]["unit"]
     default = 5.0 if unit == "F" else 2.5
-    entry   = calibration.get(f"{city_slug}_{best_source}")
-    sigma   = entry["mae"]  if entry else default
-    bias    = entry["bias"] if entry else 0.0
+    entry   = calibration.get(f"{city_slug}_{best_source}") or calibration.get(f"{city_slug}_ecmwf")
+    sigma   = (entry["mae"]  if entry else default) * SIGMA_MULTIPLIER
+    bias    = (entry["bias"] if entry else 0.0)     * BIAS_SCALE
     corrected_temp = forecast_temp - bias
     return _bucket_probability(bucket_lo, bucket_hi, corrected_temp, sigma)
 
@@ -263,6 +263,34 @@ class BotState:
         with open(STATE_PATH, "w") as f:
             json.dump({"balance": self.balance}, f, indent=2)
 
+    def reconcile(self) -> None:
+        """
+        Recalculate balance from market files and fix any discrepancy.
+
+        Computes: INITIAL_BALANCE + sum(pnl for all resolved markets)
+                + sum(size for all still-open positions, since that cash is still deployed)
+
+        Prints a warning if the stored balance differs by more than $0.01.
+        """
+        resolved_pnl  = 0.0
+        open_deployed = 0.0
+        for path in glob.glob(os.path.join(DATA_DIR, "*.json")):
+            with open(path) as f:
+                mkt = json.load(f)
+            if mkt.get("pnl") is not None:
+                resolved_pnl += mkt["pnl"]
+            elif mkt.get("position") and mkt["position"].get("close_reason") is None:
+                open_deployed += mkt["position"].get("size", 0.0)
+
+        correct = round(INITIAL_BALANCE + resolved_pnl - open_deployed, 2)
+        if abs(correct - self.balance) > 0.01:
+            print(f"[reconcile] Balance mismatch: stored=${self.balance:.2f} "
+                  f"correct=${correct:.2f} — fixing.")
+            self.balance = correct
+            self.save()
+        else:
+            print(f"[reconcile] Balance OK: ${self.balance:.2f}")
+
     def open_position(self, market: dict, outcome: dict,
                       size_dollars: float, ev: float, kelly: float) -> None:
         """Record a new YES position. Entry is at ask price."""
@@ -281,7 +309,8 @@ class BotState:
         self.balance = round(self.balance - size_dollars, 2)
         print(f"  OPEN  {market['city']} {market['date']} | "
               f"bucket={outcome['label']} ask={ask:.3f} "
-              f"size=${size_dollars:.2f} ev={ev:.4f}")
+              f"size=${size_dollars:.2f} ev={ev:.4f} "
+              f"at={market['position']['opened_at']}")
 
     def close_position(self, market: dict, bid_price: float, reason: str) -> None:
         """Close open position at current bid. Realise P&L."""
@@ -296,7 +325,8 @@ class BotState:
         pos["closed_at"]     = _now_iso()
         market["pnl"]        = pnl
         print(f"  CLOSE {market['city']} {market['date']} | "
-              f"reason={reason} bid={bid_price:.3f} pnl=${pnl:+.2f}")
+              f"reason={reason} bid={bid_price:.3f} pnl=${pnl:+.2f} "
+              f"at={pos['closed_at']}")
 
     @staticmethod
     def check_stops(market: dict, current_bid: float,
@@ -320,7 +350,7 @@ class BotState:
         if current_bid > peak:
             pos["peak_bid"] = current_bid
 
-        if current_bid <= entry * 0.80:
+        if current_bid <= entry * 0.65:
             return "stop_loss"
 
         if peak >= entry * 1.20 and current_bid <= entry:

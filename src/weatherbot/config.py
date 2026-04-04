@@ -26,6 +26,8 @@ SCAN_INTERVAL   = CONFIG["scan_interval"]
 CALIBRATION_MIN  = CONFIG["calibration_min"]
 MAX_EV           = CONFIG.get("max_ev", 0.5)
 MAX_POSITIONS    = CONFIG.get("max_positions", 10)
+SIGMA_MULTIPLIER = CONFIG.get("sigma_multiplier", 1.0)
+BIAS_SCALE       = CONFIG.get("bias_scale", 1.0)
 INITIAL_BALANCE  = CONFIG["balance"]
 
 # Paths

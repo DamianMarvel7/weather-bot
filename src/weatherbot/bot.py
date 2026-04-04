@@ -37,6 +37,7 @@ class WeatherBot:
 
     def __init__(self) -> None:
         self.state       = BotState.load()
+        self.state.reconcile()
         self.calibration = load_calibration()
         self.tg          = None   # TelegramNotifier — set by weatherbet.py if configured
 
@@ -106,11 +107,11 @@ class WeatherBot:
         for city, date, pos in open_positions:
             print(f"  {city} {date}  bucket={pos['bucket']}  "
                   f"size=${pos['size']:.2f}  entry={pos['entry_ask']:.3f}  "
-                  f"ev={pos['ev']:.4f}")
+                  f"ev={pos['ev']:.4f}  opened={pos.get('opened_at', '-')}")
         print()
 
     @staticmethod
-    def cmd_report() -> None:
+    def cmd_report(last_n: int | None = None) -> None:
         rows = []
         for path in glob.glob(os.path.join(DATA_DIR, "*.json")):
             with open(path) as f:
@@ -122,23 +123,84 @@ class WeatherBot:
             print("No resolved markets yet.")
             return
 
-        rows.sort(key=lambda m: m["date"])
+        rows.sort(key=lambda m: (m.get("position") or {}).get("closed_at", m["date"]))
+        if last_n is not None:
+            rows = rows[-last_n:]
+
         wins      = sum(1 for r in rows if r["pnl"] > 0)
         losses    = sum(1 for r in rows if r["pnl"] <= 0)
         total_pnl = sum(r["pnl"] for r in rows)
 
-        print(f"\nResolved markets: {len(rows)}  W/L: {wins}/{losses}  "
+        label = f"Last {last_n} trades" if last_n is not None else f"Resolved markets: {len(rows)}"
+        print(f"\n{label}  W/L: {wins}/{losses}  "
               f"Total P&L: ${total_pnl:+.2f}\n")
-        print(f"{'City':<14} {'Date':<12} {'Our Bucket':<20} {'PM Resolved':<20} {'VC Actual':>10} {'P&L':>8}  Reason")
-        print("-" * 100)
+        print(f"{'City':<14} {'Mkt Date':<12} {'Our Bucket':<20} {'PM Resolved':<20} {'VC Actual':>10} {'P&L':>8}  {'Reason':<18} {'Opened At':<22} Closed At")
+        print("-" * 142)
         for r in rows:
             pos        = r.get("position", {}) or {}
             bucket     = pos.get("bucket", "-")
             pm_resolved = r.get("resolved_outcome", "-")
             actual     = f"{r['actual_temp']:.1f}" if r.get("actual_temp") else "-"
             reason     = pos.get("close_reason", "-")
+            opened_at  = pos.get("opened_at", "-")
+            closed_at  = pos.get("closed_at", "-")
             print(f"{r['city']:<14} {r['date']:<12} {bucket:<20} {pm_resolved:<20} {actual:>10} "
-                  f"${r['pnl']:>+7.2f}  {reason}")
+                  f"${r['pnl']:>+7.2f}  {reason:<18} {opened_at:<22} {closed_at}")
+        print()
+
+    def cmd_scan_dry(self) -> None:
+        """
+        Dry-run scan: shows every city/date evaluated and why buckets
+        pass or fail the entry filter. No positions are opened.
+        """
+        from .config import MIN_HOURS, MAX_HOURS, MIN_EV, MAX_EV, MIN_PRICE, MAX_PRICE, MAX_SLIPPAGE
+        self.calibration = load_calibration()
+        today = datetime.now(timezone.utc).date()
+        scan_dates = [(today + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(3)]
+        open_count = self._count_open_positions()
+        print(f"\nDry-run scan  (open positions: {open_count}/{MAX_POSITIONS})\n")
+
+        for city_slug in LOCATIONS:
+            for date_str in scan_dates:
+                event = get_polymarket_event(city_slug, date_str)
+                if event is None:
+                    continue
+                hours_left = event["hours_left"]
+                forecast   = get_best_forecast(city_slug, date_str, hours_left)
+                if forecast["best"] is None:
+                    print(f"  {city_slug} {date_str}  SKIP no forecast")
+                    continue
+
+                temp        = forecast["best"]
+                best_source = forecast["best_source"] or "ecmwf"
+                print(f"  {city_slug} {date_str}  forecast={temp:.1f} ({best_source})  hours_left={hours_left:.1f}")
+
+                for outcome in event["outcomes"]:
+                    ask = outcome.get("ask")
+                    bid = outcome.get("bid")
+                    label = outcome.get("label", "?")
+                    if ask is None:
+                        print(f"    {label:<22} SKIP  no ask price")
+                        continue
+                    if ask < MIN_PRICE or ask >= MAX_PRICE:
+                        print(f"    {label:<22} SKIP  ask={ask:.3f} outside [{MIN_PRICE},{MAX_PRICE})")
+                        continue
+                    if bid is not None and (ask - bid) > MAX_SLIPPAGE:
+                        print(f"    {label:<22} SKIP  spread={ask-bid:.3f} > {MAX_SLIPPAGE}")
+                        continue
+                    p  = get_probability(city_slug, outcome["lo"], outcome["hi"],
+                                         temp, best_source, self.calibration)
+                    ev = calc_ev(p, ask)
+                    flag = ""
+                    if p < 0.05:
+                        flag = f"SKIP  p={p:.3f} < 0.05"
+                    elif ev <= MIN_EV:
+                        flag = f"SKIP  ev={ev:.4f} <= {MIN_EV}"
+                    elif ev > MAX_EV:
+                        flag = f"SKIP  ev={ev:.4f} > {MAX_EV} (artifact)"
+                    else:
+                        flag = f"PASS  p={p:.3f} ev={ev:.4f} ask={ask:.3f}"
+                    print(f"    {label:<22} {flag}")
         print()
 
     @staticmethod
