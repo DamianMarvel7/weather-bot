@@ -292,9 +292,10 @@ class BotState:
             print(f"[reconcile] Balance OK: ${self.balance:.2f}")
 
     def open_position(self, market: dict, outcome: dict,
-                      size_dollars: float, ev: float, kelly: float) -> None:
-        """Record a new YES position. Entry is at ask price."""
-        ask = outcome["ask"]
+                      size_dollars: float, ev: float, kelly: float,
+                      fill_price: float | None = None) -> None:
+        """Record a new YES position. Entry is at fill_price (defaults to outcome ask)."""
+        ask = fill_price if fill_price is not None else outcome["ask"]
         market["position"] = {
             "bucket":       outcome["label"],
             "token_id":     outcome["token_id"],

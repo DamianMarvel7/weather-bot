@@ -13,6 +13,7 @@ from .config import (
     DATA_DIR, LOCATIONS, VC_KEY,
     MAX_BET, MIN_EV, MAX_EV, MIN_PRICE, MAX_PRICE, MAX_SLIPPAGE, MAX_POSITIONS,
 )
+from .execution import PaperExecutor
 from .forecast import get_best_forecast
 from .polymarket import get_polymarket_event, get_clob_prices, check_gamma_resolved
 from .portfolio import (
@@ -35,11 +36,12 @@ class WeatherBot:
         bot.monitor_stops()     # background thread every 10 min
     """
 
-    def __init__(self) -> None:
+    def __init__(self, executor=None) -> None:
         self.state       = BotState.load()
         self.state.reconcile()
         self.calibration = load_calibration()
         self.tg          = None   # TelegramNotifier — set by weatherbet.py if configured
+        self.executor    = executor or PaperExecutor()
 
     # ------------------------------------------------------------------
     # Public entry points
@@ -81,8 +83,11 @@ class WeatherBot:
                 continue
             stop = BotState.check_stops(mkt, cur_bid, None)
             if stop:
-                pos = mkt.get("position", {})
-                self.state.close_position(mkt, cur_bid, stop)
+                pos  = mkt.get("position", {})
+                fill = self.executor.exit(token_id, cur_bid)
+                if not fill.filled:
+                    continue
+                self.state.close_position(mkt, fill.fill_price, stop)
                 save_market(mkt)
                 if self.tg:
                     from .telegram_bot import notify_closed
@@ -333,20 +338,7 @@ class WeatherBot:
 
         resolved_bucket = None
 
-        # --- Pass 1: CLOB orderbook prices ---
-        for outcome in market.get("all_outcomes", []):
-            token_id = outcome.get("token_id")
-            if not token_id:
-                continue
-            bid, ask = get_clob_prices(token_id)
-            if bid is None:
-                continue
-            mid = (bid + ask) / 2 if ask else bid
-            if mid >= 0.95:
-                resolved_bucket = outcome["label"]
-                break
-
-        # --- Pass 2: Gamma API closed flag (handles post-deadline markets) ---
+        # --- Pass 1: Gamma API closed flag (handles post-deadline markets) ---
         if resolved_bucket is None:
             for outcome in market.get("all_outcomes", []):
                 market_id = outcome.get("market_id")
@@ -357,7 +349,7 @@ class WeatherBot:
                     resolved_bucket = outcome["label"]
                     break
 
-        # --- Pass 3: Historical closed events search (fallback when market_id missing) ---
+        # --- Pass 2: Historical closed events search (fallback when market_id missing) ---
         if resolved_bucket is None:
             from .polymarket import get_polymarket_historical_resolved
             label, _ = get_polymarket_historical_resolved(market["city"], market["date"])
@@ -424,7 +416,10 @@ class WeatherBot:
                                        cur_bid, cur_ask or cur_bid)
                 stop = BotState.check_stops(mkt, cur_bid, forecast["best"])
                 if stop:
-                    self.state.close_position(mkt, cur_bid, stop)
+                    fill = self.executor.exit(pos["token_id"], cur_bid)
+                    if not fill.filled:
+                        return
+                    self.state.close_position(mkt, fill.fill_price, stop)
                     if self.tg:
                         from .telegram_bot import notify_closed
                         notify_closed(self.tg, mkt, pos, stop, cur_bid)
@@ -488,7 +483,12 @@ class WeatherBot:
         if size_dollars < 1.0 or size_dollars > balance:
             return
 
-        self.state.open_position(market, best_out, size_dollars, best_ev, kelly_frac)
+        fill = self.executor.enter(best_out["token_id"], best_out["ask"], best_out.get("bid"))
+        if not fill.filled:
+            return
+
+        self.state.open_position(market, best_out, size_dollars, best_ev, kelly_frac,
+                                 fill_price=fill.fill_price)
         if self.tg:
             from .telegram_bot import notify_opened
             notify_opened(self.tg, market, market["position"])
