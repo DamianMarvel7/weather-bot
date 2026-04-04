@@ -1,7 +1,0 @@
-requests>=2.32
-pandas>=2.2
-numpy>=2.0
-matplotlib>=3.9
-seaborn>=0.13
-scikit-learn>=1.5
-ipykernel>=6.29

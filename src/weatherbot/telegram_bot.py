@@ -278,6 +278,31 @@ def notify_closed(tg: TelegramNotifier, market: dict, pos: dict,
         vc_actual   = market.get("actual_temp")
         vc_str      = f"{vc_actual:.1f}°" if vc_actual is not None else "?"
         extra = f"\n🏆 PM resolved: <b>{pm_resolved}</b>\n🌡 VC actual: <b>{vc_str}</b>"
+    elif reason == "stop_loss":
+        drop_pct = (entry - exit_bid) / entry * 100 if entry else 0
+        extra = (
+            f"\n📉 Bid dropped <b>{drop_pct:.1f}%</b> below entry"
+            f" ({entry:.3f} → {exit_bid:.3f})"
+        )
+    elif reason == "trailing_stop":
+        peak     = pos.get("peak_bid") or entry
+        peak_pct = (peak - entry) / entry * 100 if entry else 0
+        fall_pct = (peak - exit_bid) / peak * 100 if peak else 0
+        extra = (
+            f"\n📈 Rode up <b>+{peak_pct:.1f}%</b> (peak {peak:.3f})"
+            f", then fell <b>{fall_pct:.1f}%</b> back to {exit_bid:.3f}"
+        )
+    elif reason == "forecast_change":
+        d       = pos.get("close_detail") or {}
+        fc      = d.get("forecast_temp")
+        src     = d.get("best_source", "")
+        bucket  = pos.get("bucket", "?")
+        src_str = f" ({src})" if src else ""
+        fc_str  = f"{fc:.1f}°{src_str}" if fc is not None else "—"
+        extra = (
+            f"\n🌡 Forecast now <b>{fc_str}</b>"
+            f" — moved outside bucket <b>{bucket}</b>"
+        )
 
     closed_at  = pos.get("closed_at", "")
     opened_at  = pos.get("opened_at", "")

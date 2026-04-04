@@ -1,0 +1,15 @@
+[Unit]
+Description=Polymarket Weather Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=YOUR_USER
+WorkingDirectory=/home/YOUR_USER/polymarket_bot
+ExecStart=/home/YOUR_USER/.local/bin/uv run weatherbot
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

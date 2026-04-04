@@ -34,8 +34,10 @@ INITIAL_BALANCE  = CONFIG["balance"]
 DATA_DIR         = os.path.join(_PROJECT_ROOT, "data", "markets")
 CALIBRATION_PATH = os.path.join(_PROJECT_ROOT, "data", "calibration.json")
 STATE_PATH       = os.path.join(_PROJECT_ROOT, "data", "bot_state.json")
+LOG_DIR          = os.path.join(_PROJECT_ROOT, "logs")
 
 os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(LOG_DIR, exist_ok=True)
 
 # API roots
 GAMMA_API = "https://gamma-api.polymarket.com"

@@ -313,7 +313,8 @@ class BotState:
               f"size=${size_dollars:.2f} ev={ev:.4f} "
               f"at={market['position']['opened_at']}")
 
-    def close_position(self, market: dict, bid_price: float, reason: str) -> None:
+    def close_position(self, market: dict, bid_price: float, reason: str,
+                       detail: dict | None = None) -> None:
         """Close open position at current bid. Realise P&L."""
         pos = market["position"]
         if pos is None:
@@ -324,6 +325,8 @@ class BotState:
         pos["close_reason"]  = reason
         pos["close_bid"]     = bid_price
         pos["closed_at"]     = _now_iso()
+        if detail:
+            pos["close_detail"] = detail
         market["pnl"]        = pnl
         print(f"  CLOSE {market['city']} {market['date']} | "
               f"reason={reason} bid={bid_price:.3f} pnl=${pnl:+.2f} "

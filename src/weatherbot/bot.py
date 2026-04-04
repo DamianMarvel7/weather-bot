@@ -116,6 +116,29 @@ class WeatherBot:
         print()
 
     @staticmethod
+    def _close_detail_str(pos: dict) -> str:
+        """Return a compact detail string explaining *why* the position was closed."""
+        reason = pos.get("close_reason", "")
+        entry  = pos.get("entry_ask") or 0
+        bid    = pos.get("close_bid") or 0
+        if reason == "stop_loss":
+            drop = (entry - bid) / entry * 100 if entry else 0
+            return f"-{drop:.0f}% drop ({entry:.3f}→{bid:.3f})"
+        if reason == "trailing_stop":
+            peak     = pos.get("peak_bid") or entry
+            peak_pct = (peak - entry) / entry * 100 if entry else 0
+            return f"+{peak_pct:.0f}% peak, fell to {bid:.3f}"
+        if reason == "forecast_change":
+            d   = pos.get("close_detail") or {}
+            fc  = d.get("forecast_temp")
+            src = d.get("best_source", "")
+            if fc is not None:
+                src_str = f" ({src})" if src else ""
+                return f"fc={fc:.1f}°{src_str}"
+            return ""
+        return ""
+
+    @staticmethod
     def cmd_report(last_n: int | None = None) -> None:
         rows = []
         for path in glob.glob(os.path.join(DATA_DIR, "*.json")):
@@ -139,18 +162,19 @@ class WeatherBot:
         label = f"Last {last_n} trades" if last_n is not None else f"Resolved markets: {len(rows)}"
         print(f"\n{label}  W/L: {wins}/{losses}  "
               f"Total P&L: ${total_pnl:+.2f}\n")
-        print(f"{'City':<14} {'Mkt Date':<12} {'Our Bucket':<20} {'PM Resolved':<20} {'VC Actual':>10} {'P&L':>8}  {'Reason':<18} {'Opened At':<22} Closed At")
-        print("-" * 142)
+        print(f"{'City':<14} {'Mkt Date':<12} {'Our Bucket':<20} {'PM Resolved':<20} {'VC Actual':>10} {'P&L':>8}  {'Reason':<18} {'Close Detail':<30} {'Opened At':<22} Closed At")
+        print("-" * 172)
         for r in rows:
-            pos        = r.get("position", {}) or {}
-            bucket     = pos.get("bucket", "-")
+            pos         = r.get("position", {}) or {}
+            bucket      = pos.get("bucket", "-")
             pm_resolved = r.get("resolved_outcome", "-")
-            actual     = f"{r['actual_temp']:.1f}" if r.get("actual_temp") else "-"
-            reason     = pos.get("close_reason", "-")
-            opened_at  = pos.get("opened_at", "-")
-            closed_at  = pos.get("closed_at", "-")
+            actual      = f"{r['actual_temp']:.1f}" if r.get("actual_temp") else "-"
+            reason      = pos.get("close_reason", "-")
+            detail      = WeatherBot._close_detail_str(pos)
+            opened_at   = pos.get("opened_at", "-")
+            closed_at   = pos.get("closed_at", "-")
             print(f"{r['city']:<14} {r['date']:<12} {bucket:<20} {pm_resolved:<20} {actual:>10} "
-                  f"${r['pnl']:>+7.2f}  {reason:<18} {opened_at:<22} {closed_at}")
+                  f"${r['pnl']:>+7.2f}  {reason:<18} {detail:<30} {opened_at:<22} {closed_at}")
         print()
 
     def cmd_scan_dry(self) -> None:
@@ -419,7 +443,13 @@ class WeatherBot:
                     fill = self.executor.exit(pos["token_id"], cur_bid)
                     if not fill.filled:
                         return
-                    self.state.close_position(mkt, fill.fill_price, stop)
+                    detail = None
+                    if stop == "forecast_change":
+                        detail = {
+                            "forecast_temp": forecast["best"],
+                            "best_source":   forecast.get("best_source", ""),
+                        }
+                    self.state.close_position(mkt, fill.fill_price, stop, detail=detail)
                     if self.tg:
                         from .telegram_bot import notify_closed
                         notify_closed(self.tg, mkt, pos, stop, cur_bid)

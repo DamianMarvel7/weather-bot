@@ -1,1 +1,0 @@
-.\start_bot.ps1 
