@@ -1,7 +1,7 @@
 {
   "balance": 10000.0,
   "max_bet": 20.0,
-  "min_ev": 0.10,
+  "min_ev": 0.25,
   "max_price": 0.45,
   "min_price": 0.05,
   "min_volume": 2000,
@@ -14,5 +14,11 @@
   "max_ev": 1.5,
   "max_positions": 10,
   "sigma_multiplier": 1.8,
-  "bias_scale": 1.0
+  "bias_scale": 1.0,
+  "stop_loss_threshold": 0.35,
+  "city_blacklist": [
+    "london", "paris", "hong-kong", "shanghai", "sao-paulo", "tokyo",
+    "seattle", "beijing", "chicago", "madrid", "chengdu", "milan",
+    "singapore", "seoul", "wellington", "tel-aviv", "buenos-aires"
+  ]
 }

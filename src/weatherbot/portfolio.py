@@ -14,6 +14,7 @@ from .config import (
     DATA_DIR, CALIBRATION_PATH, STATE_PATH,
     INITIAL_BALANCE, KELLY_FRACTION, CALIBRATION_MIN,
     LOCATIONS, SIGMA_MULTIPLIER, BIAS_SCALE,
+    STOP_LOSS_THRESHOLD,
 )
 from .polymarket import parse_bucket_bounds
 
@@ -354,7 +355,7 @@ class BotState:
         if current_bid > peak:
             pos["peak_bid"] = current_bid
 
-        if current_bid <= entry * 0.65:
+        if current_bid <= entry * STOP_LOSS_THRESHOLD:
             return "stop_loss"
 
         if peak >= entry * 1.20 and current_bid <= entry:

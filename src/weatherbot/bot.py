@@ -12,6 +12,7 @@ import requests
 from .config import (
     DATA_DIR, LOCATIONS, VC_KEY,
     MAX_BET, MIN_EV, MAX_EV, MIN_PRICE, MAX_PRICE, MAX_SLIPPAGE, MAX_POSITIONS,
+    CITY_BLACKLIST,
 )
 from .execution import PaperExecutor
 from .forecast import get_best_forecast
@@ -52,6 +53,8 @@ class WeatherBot:
         self.calibration = load_calibration()
 
         for city_slug in LOCATIONS:
+            if city_slug in CITY_BLACKLIST:
+                continue
             for date_str in self._scan_dates():
                 try:
                     self._process_city_date(city_slug, date_str)
@@ -190,6 +193,8 @@ class WeatherBot:
         print(f"\nDry-run scan  (open positions: {open_count}/{MAX_POSITIONS})\n")
 
         for city_slug in LOCATIONS:
+            if city_slug in CITY_BLACKLIST:
+                continue
             for date_str in scan_dates:
                 event = get_polymarket_event(city_slug, date_str)
                 if event is None:

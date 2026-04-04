@@ -47,6 +47,14 @@ data/
 2. **CLOB API** (`https://clob.polymarket.com/prices-history`) — called once per market using the YES `clobTokenIds[0]` token; returns `{"history": [{"t": unix_ts, "p": price}]}`. First point → `start_price_yes`; last point → `final_price_yes`.
 3. Both raw responses are cached to `data/raw/` so the expensive fetch only happens once. The price-history cache is incremental: interrupted runs resume from where they left off.
 
+## REQUIRED: After Every Code or Config Change
+
+**Always** create a filled-in change log at `memory/bot_changes/YYYY-MM-DD_<short_description>.md` using the template at `memory/templates/bot_change_log.md`, then link it in `memory/index.md` under "Bot Changes".
+
+This applies to any edit to: `config.json`, `bot.py`, `portfolio.py`, `execution.py`, `forecast.py`, `polymarket.py`, or any other file that affects live trading behaviour.
+
+Do not skip this step even for small config tweaks.
+
 ## Key Design Decisions
 
 - **`--skip-prices` mode**: runs everything using only Gamma data; `start_price_yes` is NaN and rows that require it are kept (not dropped). Useful when iterating on cleaning or feature logic.

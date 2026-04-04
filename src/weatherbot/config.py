@@ -24,11 +24,13 @@ MAX_HOURS       = CONFIG["max_hours"]
 MAX_SLIPPAGE    = CONFIG["max_slippage"]
 SCAN_INTERVAL   = CONFIG["scan_interval"]
 CALIBRATION_MIN  = CONFIG["calibration_min"]
-MAX_EV           = CONFIG.get("max_ev", 0.5)
-MAX_POSITIONS    = CONFIG.get("max_positions", 10)
-SIGMA_MULTIPLIER = CONFIG.get("sigma_multiplier", 1.0)
-BIAS_SCALE       = CONFIG.get("bias_scale", 1.0)
-INITIAL_BALANCE  = CONFIG["balance"]
+MAX_EV              = CONFIG.get("max_ev", 0.5)
+MAX_POSITIONS       = CONFIG.get("max_positions", 10)
+SIGMA_MULTIPLIER    = CONFIG.get("sigma_multiplier", 1.0)
+BIAS_SCALE          = CONFIG.get("bias_scale", 1.0)
+INITIAL_BALANCE     = CONFIG["balance"]
+STOP_LOSS_THRESHOLD = CONFIG.get("stop_loss_threshold", 0.65)
+CITY_BLACKLIST      = set(CONFIG.get("city_blacklist", []))
 
 # Paths
 DATA_DIR         = os.path.join(_PROJECT_ROOT, "data", "markets")
