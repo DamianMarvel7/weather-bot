@@ -47,13 +47,16 @@ data/
 2. **CLOB API** (`https://clob.polymarket.com/prices-history`) — called once per market using the YES `clobTokenIds[0]` token; returns `{"history": [{"t": unix_ts, "p": price}]}`. First point → `start_price_yes`; last point → `final_price_yes`.
 3. Both raw responses are cached to `data/raw/` so the expensive fetch only happens once. The price-history cache is incremental: interrupted runs resume from where they left off.
 
-## REQUIRED: After Every Code or Config Change
+## Documenting Bot Changes
 
-**Always** create a filled-in change log at `memory/bot_changes/YYYY-MM-DD_<short_description>.md` using the template at `memory/templates/bot_change_log.md`, then link it in `memory/index.md` under "Bot Changes".
+The knowledge base lives in `memory/` (Obsidian wiki). Use the `/update-bot-memory` skill to document changes — it handles bot_changes entries, log.md, insights, and index updates in one pass.
 
-This applies to any edit to: `config.json`, `bot.py`, `portfolio.py`, `execution.py`, `forecast.py`, `polymarket.py`, or any other file that affects live trading behaviour.
+Invoke it when:
+- A session of changes is complete and worth keeping
+- Something was learned about edge, risk, or market behaviour
+- The user explicitly asks to save or log something
 
-Do not skip this step even for small config tweaks.
+Do **not** auto-write to `memory/` after every individual edit — wait for the user to invoke `/update-bot-memory` when they're satisfied with the session's work.
 
 ## Key Design Decisions
 
