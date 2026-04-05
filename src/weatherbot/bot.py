@@ -458,6 +458,11 @@ class WeatherBot:
                     if self.tg:
                         from .telegram_bot import notify_closed
                         notify_closed(self.tg, mkt, pos, stop, cur_bid)
+                    # Don't re-open immediately after a forecast_change close —
+                    # wait for the next scan to avoid paying the spread twice.
+                    if stop == "forecast_change":
+                        save_market(mkt)
+                        return
 
         if mkt.get("position") is None or mkt["position"].get("close_reason") is not None:
             self._maybe_open(mkt, event, forecast, hours_left)

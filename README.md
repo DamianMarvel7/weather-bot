@@ -49,6 +49,13 @@ uv run weatherbet.py report
 
 # Show edge/calibration breakdown by EV bucket, city, and close reason
 uv run weatherbet.py edge
+
+# Daily PnL report
+uv run pnl.py                      # all-time
+uv run pnl.py --from 2026-03-01    # from date
+uv run pnl.py --to 2026-04-01      # up to date
+uv run pnl.py --city nyc           # filter by city
+uv run pnl.py --summary            # totals only
 ```
 
 ---
