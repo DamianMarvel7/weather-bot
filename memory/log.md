@@ -16,3 +16,6 @@ Edge report (`weatherbet.py edge`) found 11 more cities with negative PnL and �
 
 ## [2026-04-05] bug-fix + config | Fix forecast_change churn, raise min_price 0.05→0.12, min_ev 0.25→0.50, max_positions 10→4
 Churn bug caused same market to be re-entered in same scan after forecast_change close (paid spread twice). Thin-price entries (5-8 cent buckets) had 40-60% spread cost. → See [[bot_changes/2026-04-05_reduce_churn_and_tighten_filters]]
+
+## [2026-04-05] config | Revert max_positions 4→10, high-volume jackpot strategy
+Accept most trades lose; run enough volume so one large win covers all cumulative losses. → See [[bot_changes/2026-04-05_revert_max_positions_to_10]]
