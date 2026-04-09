@@ -26,10 +26,10 @@ SCAN_INTERVAL   = CONFIG["scan_interval"]
 CALIBRATION_MIN  = CONFIG["calibration_min"]
 MAX_EV              = CONFIG.get("max_ev", 0.5)
 MAX_POSITIONS       = CONFIG.get("max_positions", 10)
-SIGMA_MULTIPLIER    = CONFIG.get("sigma_multiplier", 1.0)
 BIAS_SCALE          = CONFIG.get("bias_scale", 1.0)
 INITIAL_BALANCE     = CONFIG["balance"]
-STOP_LOSS_THRESHOLD = CONFIG.get("stop_loss_threshold", 0.65)
+MAX_FORECAST_SPREAD_F = CONFIG.get("max_forecast_spread_f", 4.0)
+MAX_FORECAST_SPREAD_C = CONFIG.get("max_forecast_spread_c", 2.0)
 CITY_BLACKLIST      = set(CONFIG.get("city_blacklist", []))
 
 # Paths

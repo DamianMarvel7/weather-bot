@@ -13,8 +13,7 @@ from datetime import datetime, timezone
 from .config import (
     DATA_DIR, CALIBRATION_PATH, STATE_PATH,
     INITIAL_BALANCE, KELLY_FRACTION, CALIBRATION_MIN,
-    LOCATIONS, SIGMA_MULTIPLIER, BIAS_SCALE,
-    STOP_LOSS_THRESHOLD,
+    LOCATIONS, BIAS_SCALE,
 )
 from .polymarket import parse_bucket_bounds
 
@@ -161,13 +160,14 @@ def _resolved_temp_estimate(mkt: dict) -> float | None:
 
 def run_calibration() -> dict:
     """
-    Compute MAE and BIAS per (city, source) from resolved markets.
+    Compute MAE, BIAS, and STD per (city, source) from resolved markets.
 
-    bias = mean(forecast − actual): positive → model runs warm, negative → model runs cold.
-    Bias is used in get_probability() to shift the forecast before computing bucket probability,
-    directly correcting systematic station offsets.
+    Only uses markets with independent ground truth (Visual Crossing actual_temp).
+    Does NOT fall back to resolved bucket midpoint — that creates circular
+    calibration where the model trains on derived market data.
 
-    Falls back to resolved bucket midpoint when VC actual_temp is unavailable.
+    bias = mean(forecast − actual): positive → model runs warm.
+    std  = stdev(forecast errors): used directly as sigma in get_probability().
     """
     all_markets = []
     for path in glob.glob(os.path.join(DATA_DIR, "*.json")):
@@ -183,7 +183,8 @@ def run_calibration() -> dict:
             abs_errors: list[float] = []
             signed_errors: list[float] = []
             for mkt in city_markets:
-                actual = _resolved_temp_estimate(mkt)
+                # Only use independent ground truth — no bucket midpoint fallback
+                actual = mkt.get("actual_temp")
                 if actual is None:
                     continue
                 snaps = [s for s in mkt.get("forecast_snapshots", [])
@@ -196,9 +197,12 @@ def run_calibration() -> dict:
                 signed_errors.append(err)
 
             if len(abs_errors) >= CALIBRATION_MIN:
+                mean_err = sum(signed_errors) / len(signed_errors)
+                std = (sum((e - mean_err) ** 2 for e in signed_errors) / len(signed_errors)) ** 0.5
                 calib[f"{city_slug}_{source}"] = {
                     "mae":  round(sum(abs_errors) / len(abs_errors), 3),
-                    "bias": round(sum(signed_errors) / len(signed_errors), 3),
+                    "bias": round(mean_err, 3),
+                    "std":  round(std, 3),
                     "n":    len(abs_errors),
                 }
 
@@ -221,16 +225,16 @@ def get_probability(city_slug: str, bucket_lo: float, bucket_hi: float,
     """
     P(actual in bucket) using a bias-corrected, calibrated normal distribution.
 
-    sigma default: 5°F / 2.5°C — based on published ECMWF 48h max-temp MAE.
+    sigma: uses calibrated std (standard deviation of forecast errors) when
+    available; falls back to conservative defaults (3.5°F / 2.0°C).
     bias correction: subtracts the model's historical systematic offset from the
-    forecast before computing bucket probability (e.g. if the model runs 2°C warm
-    at this station, the corrected forecast is shifted 2°C cooler).
+    forecast before computing bucket probability.
     """
     unit    = LOCATIONS[city_slug]["unit"]
-    default = 5.0 if unit == "F" else 2.5
+    default_std = 3.5 if unit == "F" else 2.0
     entry   = calibration.get(f"{city_slug}_{best_source}") or calibration.get(f"{city_slug}_ecmwf")
-    sigma   = (entry["mae"]  if entry else default) * SIGMA_MULTIPLIER
-    bias    = (entry["bias"] if entry else 0.0)     * BIAS_SCALE
+    sigma   = entry["std"] if entry and "std" in entry else default_std
+    bias    = (entry["bias"] if entry else 0.0) * BIAS_SCALE
     corrected_temp = forecast_temp - bias
     return _bucket_probability(bucket_lo, bucket_hi, corrected_temp, sigma)
 
@@ -335,14 +339,17 @@ class BotState:
 
     @staticmethod
     def check_stops(market: dict, current_bid: float,
-                    forecast_temp: float | None) -> str | None:
+                    forecast_temp: float | None,
+                    metar_temp: float | None = None,
+                    hours_left: float | None = None,
+                    calibration: dict | None = None) -> str | None:
         """
         Return stop reason or None.
 
-        Conditions (priority order):
-          stop_loss      — bid dropped ≥20% below entry ask
-          trailing_stop  — bid reached +20% then fell back to ≤ entry ask
-          forecast_change — forecast moved outside bought bucket (±2°F/1°C buffer)
+        Hold-to-resolution strategy: no stop-loss or trailing-stop.
+        Only exit early when physical evidence contradicts the position:
+          metar_diverge   — hours_left < 12 and METAR observation outside bucket
+          forecast_change — forecast moved far outside bought bucket (>1.5σ buffer)
         """
         pos = market["position"]
         if pos is None:
@@ -355,14 +362,29 @@ class BotState:
         if current_bid > peak:
             pos["peak_bid"] = current_bid
 
-        if current_bid <= entry * STOP_LOSS_THRESHOLD:
-            return "stop_loss"
+        # Compute calibrated sigma for buffer sizing
+        default_std = 3.5 if unit == "F" else 2.0
+        sigma = default_std
+        if calibration:
+            city = market["city"]
+            entry_data = calibration.get(f"{city}_hrrr") or calibration.get(f"{city}_ecmwf")
+            if entry_data and "std" in entry_data:
+                sigma = entry_data["std"]
 
-        if peak >= entry * 1.20 and current_bid <= entry:
-            return "trailing_stop"
+        # METAR divergence: near resolution, trust the actual observation
+        if metar_temp is not None and hours_left is not None and hours_left < 12:
+            buf = 3.0 if unit == "F" else 1.5
+            lo, hi = parse_bucket_bounds(pos["bucket"])
+            if lo != -999.0:
+                lo -= buf
+            if hi != 999.0:
+                hi += buf
+            if not (lo <= metar_temp <= hi):
+                return "metar_diverge"
 
+        # Forecast change: only exit when forecast moves >1.5σ outside bucket
         if forecast_temp is not None:
-            drift = 2.0 if unit == "F" else 1.0
+            drift = 1.5 * sigma
             lo, hi = parse_bucket_bounds(pos["bucket"])
             if lo != -999.0:
                 lo -= drift

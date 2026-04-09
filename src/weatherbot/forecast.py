@@ -1,51 +1,42 @@
 """
-Weather forecast retrieval: ECMWF (global), HRRR/GFS (US), and METAR observations.
+Weather forecast retrieval: multi-model ensemble via Open-Meteo, and METAR observations.
 """
 
 import requests
 
-from .config import LOCATIONS, TIMEZONES
+from .config import LOCATIONS, TIMEZONES, MAX_FORECAST_SPREAD_F, MAX_FORECAST_SPREAD_C
 
 
-def get_ecmwf(city_slug: str, dates: list) -> dict:
-    """ECMWF IFS 0.25° via Open-Meteo — global, bias-corrected, free."""
+def _fetch_open_meteo(city_slug: str, dates: list, models: list[str],
+                      temp_unit: str, forecast_days: int) -> dict[str, dict[str, float | None]]:
+    """
+    Fetch daily max temperature from Open-Meteo for one or more models.
+
+    Returns {date_str: {model_name: temp_or_None}}.
+    """
     loc = LOCATIONS[city_slug]
-    temp_unit = "fahrenheit" if loc["unit"] == "F" else "celsius"
+    models_str = ",".join(models)
     url = (
         f"https://api.open-meteo.com/v1/forecast"
         f"?latitude={loc['lat']}&longitude={loc['lon']}"
         f"&daily=temperature_2m_max&temperature_unit={temp_unit}"
-        f"&forecast_days=7&timezone={TIMEZONES.get(city_slug, 'UTC')}"
-        f"&models=ecmwf_ifs025&bias_correction=true"
+        f"&forecast_days={forecast_days}&timezone={TIMEZONES.get(city_slug, 'UTC')}"
+        f"&models={models_str}"
     )
     try:
-        data = requests.get(url, timeout=(5, 8)).json()
+        data = requests.get(url, timeout=(5, 10)).json()
         daily = data.get("daily", {})
-        result = dict(zip(daily.get("time", []), daily.get("temperature_2m_max", [])))
-        return {d: result.get(d) for d in dates}
+        times = daily.get("time", [])
+        result: dict[str, dict[str, float | None]] = {d: {} for d in dates}
+        for model in models:
+            key = f"temperature_2m_max_{model}" if len(models) > 1 else "temperature_2m_max"
+            temps = daily.get(key, [])
+            model_map = dict(zip(times, temps))
+            for d in dates:
+                result[d][model] = model_map.get(d)
+        return result
     except Exception:
-        return {d: None for d in dates}
-
-
-def get_hrrr(city_slug: str, dates: list) -> dict:
-    """GFS Seamless (HRRR-blended) via Open-Meteo — US only, D+0/D+1."""
-    if LOCATIONS[city_slug]["region"] != "us":
-        return {}
-    loc = LOCATIONS[city_slug]
-    url = (
-        f"https://api.open-meteo.com/v1/forecast"
-        f"?latitude={loc['lat']}&longitude={loc['lon']}"
-        f"&daily=temperature_2m_max&temperature_unit=fahrenheit"
-        f"&forecast_days=3&timezone={TIMEZONES.get(city_slug, 'UTC')}"
-        f"&models=gfs_seamless"
-    )
-    try:
-        data = requests.get(url, timeout=(5, 8)).json()
-        daily = data.get("daily", {})
-        result = dict(zip(daily.get("time", []), daily.get("temperature_2m_max", [])))
-        return {d: result.get(d) for d in dates}
-    except Exception:
-        return {}
+        return {d: {} for d in dates}
 
 
 def get_metar(city_slug: str) -> float | None:
@@ -66,26 +57,53 @@ def get_metar(city_slug: str) -> float | None:
 
 def get_best_forecast(city_slug: str, date_str: str, hours_ahead: float) -> dict:
     """
-    Return best forecast for a single date.
-    Priority: HRRR (US ≤48h) > ECMWF > None.
+    Return ensemble forecast for a single date.
+
+    Fetches multiple models, computes weighted average and model spread.
     METAR fetched for D+0 but doesn't drive entry decisions.
     """
-    ecmwf_map = get_ecmwf(city_slug, [date_str])
-    ecmwf = ecmwf_map.get(date_str)
+    loc = LOCATIONS[city_slug]
+    temp_unit = "fahrenheit" if loc["unit"] == "F" else "celsius"
 
-    hrrr = None
-    if LOCATIONS[city_slug]["region"] == "us" and hours_ahead <= 48:
-        hrrr_map = get_hrrr(city_slug, [date_str])
-        hrrr = hrrr_map.get(date_str)
+    # Select models based on region
+    if loc["region"] == "us" and hours_ahead <= 48:
+        models = ["gfs_seamless", "ecmwf_ifs025", "gfs_global"]
+        forecast_days = 3
+    else:
+        models = ["ecmwf_ifs025", "gfs_global", "icon_seamless"]
+        forecast_days = 7
+
+    model_data = _fetch_open_meteo(city_slug, [date_str], models, temp_unit, forecast_days)
+    day_data = model_data.get(date_str, {})
+
+    # Collect non-None forecasts
+    valid_forecasts: dict[str, float] = {}
+    for model, temp in day_data.items():
+        if temp is not None:
+            valid_forecasts[model] = temp
 
     metar = get_metar(city_slug) if hours_ahead <= 24 else None
 
-    if hrrr is not None:
-        best, best_source = hrrr, "hrrr"
-    elif ecmwf is not None:
-        best, best_source = ecmwf, "ecmwf"
-    else:
-        best, best_source = None, None
+    if not valid_forecasts:
+        return {"ecmwf": None, "hrrr": None, "metar": metar,
+                "best": None, "best_source": None,
+                "models": {}, "spread": None}
 
-    return {"ecmwf": ecmwf, "hrrr": hrrr, "metar": metar,
-            "best": best, "best_source": best_source}
+    # Ensemble average and spread
+    temps = list(valid_forecasts.values())
+    avg_temp = sum(temps) / len(temps)
+    spread = max(temps) - min(temps) if len(temps) > 1 else 0.0
+
+    # For backward compatibility, extract individual model temps
+    ecmwf = valid_forecasts.get("ecmwf_ifs025")
+    hrrr = valid_forecasts.get("gfs_seamless")
+
+    return {
+        "ecmwf":       ecmwf,
+        "hrrr":        hrrr,
+        "metar":       metar,
+        "best":        round(avg_temp, 1),
+        "best_source": "ensemble",
+        "models":      valid_forecasts,
+        "spread":      round(spread, 1),
+    }

@@ -12,7 +12,7 @@ import requests
 from .config import (
     DATA_DIR, LOCATIONS, VC_KEY,
     MAX_BET, MIN_EV, MAX_EV, MIN_PRICE, MAX_PRICE, MAX_SLIPPAGE, MAX_POSITIONS,
-    CITY_BLACKLIST,
+    CITY_BLACKLIST, MAX_FORECAST_SPREAD_F, MAX_FORECAST_SPREAD_C,
 )
 from .execution import PaperExecutor
 from .forecast import get_best_forecast
@@ -84,7 +84,7 @@ class WeatherBot:
             cur_bid, _ = get_clob_prices(token_id)
             if cur_bid is None:
                 continue
-            stop = BotState.check_stops(mkt, cur_bid, None)
+            stop = BotState.check_stops(mkt, cur_bid, None, calibration=self.calibration)
             if stop:
                 pos  = mkt.get("position", {})
                 fill = self.executor.exit(token_id, cur_bid)
@@ -209,6 +209,17 @@ class WeatherBot:
                 best_source = forecast["best_source"] or "ecmwf"
                 print(f"  {city_slug} {date_str}  forecast={temp:.1f} ({best_source})  hours_left={hours_left:.1f}")
 
+                # Normalize probabilities across all buckets
+                raw_probs: dict[str, float] = {}
+                for outcome in event["outcomes"]:
+                    p = get_probability(city_slug, outcome["lo"], outcome["hi"],
+                                        temp, best_source, self.calibration)
+                    raw_probs[outcome.get("label", "?")] = p
+                total_p = sum(raw_probs.values())
+                if total_p <= 0:
+                    print(f"    (all buckets p=0, skipping)")
+                    continue
+
                 for outcome in event["outcomes"]:
                     ask = outcome.get("ask")
                     bid = outcome.get("bid")
@@ -222,8 +233,10 @@ class WeatherBot:
                     if bid is not None and (ask - bid) > MAX_SLIPPAGE:
                         print(f"    {label:<22} SKIP  spread={ask-bid:.3f} > {MAX_SLIPPAGE}")
                         continue
-                    p  = get_probability(city_slug, outcome["lo"], outcome["hi"],
-                                         temp, best_source, self.calibration)
+                    if bid is not None and ask > 0 and (ask - bid) / ask > 0.20:
+                        print(f"    {label:<22} SKIP  spread_ratio={(ask-bid)/ask:.2f} > 0.20")
+                        continue
+                    p  = raw_probs[label] / total_p
                     ev = calc_ev(p, ask)
                     flag = ""
                     if p < 0.05:
@@ -443,7 +456,10 @@ class WeatherBot:
             if cur_bid is not None:
                 append_market_snapshot(mkt, hours_left, pos["bucket"],
                                        cur_bid, cur_ask or cur_bid)
-                stop = BotState.check_stops(mkt, cur_bid, forecast["best"])
+                stop = BotState.check_stops(mkt, cur_bid, forecast["best"],
+                                            metar_temp=forecast.get("metar"),
+                                            hours_left=hours_left,
+                                            calibration=self.calibration)
                 if stop:
                     fill = self.executor.exit(pos["token_id"], cur_bid)
                     if not fill.filled:
@@ -483,14 +499,34 @@ class WeatherBot:
     def _maybe_open(self, market: dict, event: dict, forecast: dict,
                     hours_left: float) -> None:
         """Evaluate all buckets and open the best-EV position if it clears thresholds."""
-        # Don't open more positions than the configured maximum
         if self._count_open_positions() >= MAX_POSITIONS:
             return
+
+        # Skip when forecast models disagree too much — uncertainty is too high
+        spread = forecast.get("spread")
+        if spread is not None:
+            unit = LOCATIONS[market["city"]]["unit"]
+            max_spread = MAX_FORECAST_SPREAD_F if unit == "F" else MAX_FORECAST_SPREAD_C
+            if spread > max_spread:
+                return
 
         city_slug   = market["city"]
         temp        = forecast["best"]
         best_source = forecast["best_source"] or "ecmwf"
         balance     = self.state.balance
+
+        # --- Compute raw probabilities for ALL buckets and normalize to sum=1 ---
+        raw_probs: dict[str, float] = {}
+        for outcome in event["outcomes"]:
+            p = get_probability(city_slug, outcome["lo"], outcome["hi"],
+                                temp, best_source, self.calibration)
+            raw_probs[outcome["label"]] = p
+
+        total_p = sum(raw_probs.values())
+        if total_p <= 0:
+            return
+
+        # --- Select best-EV bucket using normalized probabilities ---
         best_ev     = MIN_EV
         best_out    = None
         best_p      = 0.0
@@ -498,20 +534,18 @@ class WeatherBot:
         for outcome in event["outcomes"]:
             ask = outcome.get("ask")
             bid = outcome.get("bid")
-            # Require a real CLOB ask — skip if no live ask price
             if ask is None or ask < MIN_PRICE or ask >= MAX_PRICE:
                 continue
             if bid is not None and (ask - bid) > MAX_SLIPPAGE:
                 continue
+            # Spread-ratio filter: skip if spread > 20% of ask
+            if bid is not None and ask > 0 and (ask - bid) / ask > 0.20:
+                continue
 
-            p  = get_probability(city_slug, outcome["lo"], outcome["hi"],
-                                 temp, best_source, self.calibration)
-            # Skip buckets our model considers very unlikely regardless of ask price.
-            # Protects against buying 1-cent lottery tickets the model barely believes in.
+            p = raw_probs[outcome["label"]] / total_p
             if p < 0.05:
                 continue
             ev = calc_ev(p, ask)
-            # Cap EV — anything above MAX_EV is likely a model artifact from tiny prices
             if ev > best_ev and ev <= MAX_EV:
                 best_ev, best_out, best_p = ev, outcome, p
 
