@@ -11,10 +11,13 @@ import requests
 from .config import GAMMA_API, CLOB_API, MIN_HOURS, MAX_HOURS, MIN_VOLUME, LOCATIONS
 
 
+_session = requests.Session()
+
+
 def _gamma_get(path: str, params: dict = None) -> list | dict | None:
     """GET from Gamma API with basic error handling."""
     try:
-        resp = requests.get(f"{GAMMA_API}{path}", params=params, timeout=(5, 10))
+        resp = _session.get(f"{GAMMA_API}{path}", params=params, timeout=(5, 10))
         resp.raise_for_status()
         return resp.json()
     except Exception:
@@ -27,7 +30,7 @@ def get_clob_prices(clob_token_id: str) -> tuple[float | None, float | None]:
     We enter at ask, monitor/exit at bid — honest simulation.
     """
     try:
-        resp = requests.get(f"{CLOB_API}/book",
+        resp = _session.get(f"{CLOB_API}/book",
                             params={"token_id": clob_token_id}, timeout=(5, 8))
         resp.raise_for_status()
         book = resp.json()
@@ -39,6 +42,32 @@ def get_clob_prices(clob_token_id: str) -> tuple[float | None, float | None]:
         return best_bid, best_ask
     except Exception:
         return None, None
+
+
+# ---------------------------------------------------------------------------
+# Cached event list — fetched once per scan, reused across all city-date lookups
+# ---------------------------------------------------------------------------
+
+_cached_events: list | None = None
+
+
+def prefetch_events() -> None:
+    """Fetch the full temperature event list once. Call at start of each scan."""
+    global _cached_events
+    _cached_events = _gamma_get("/events", params={
+        "active":    "true",
+        "closed":    "false",
+        "tag_slug":  "temperature",
+        "limit":     200,
+        "order":     "createdAt",
+        "ascending": "false",
+    })
+
+
+def clear_events_cache() -> None:
+    """Clear cached events at end of scan."""
+    global _cached_events
+    _cached_events = None
 
 
 def parse_bucket_bounds(label: str) -> tuple[float, float]:
@@ -105,7 +134,7 @@ def get_polymarket_event(city_slug: str, date_str: str) -> dict | None:
     dt        = datetime.strptime(date_str, "%Y-%m-%d")
     date_frag = f"{dt.strftime('%B')} {dt.day}"  # e.g. "March 27"
 
-    events = _gamma_get("/events", params={
+    events = _cached_events if _cached_events is not None else _gamma_get("/events", params={
         "active":    "true",
         "closed":    "false",
         "tag_slug":  "temperature",

@@ -30,7 +30,9 @@ BIAS_SCALE          = CONFIG.get("bias_scale", 1.0)
 INITIAL_BALANCE     = CONFIG["balance"]
 MAX_FORECAST_SPREAD_F = CONFIG.get("max_forecast_spread_f", 4.0)
 MAX_FORECAST_SPREAD_C = CONFIG.get("max_forecast_spread_c", 2.0)
-CITY_BLACKLIST      = set(CONFIG.get("city_blacklist", []))
+CITY_BLACKLIST          = set(CONFIG.get("city_blacklist", []))
+MAX_LEGS_PER_EVENT      = CONFIG.get("max_legs_per_event", 5)
+MAX_EXPOSURE_PER_EVENT  = CONFIG.get("max_exposure_per_event", 15.0)
 
 # Paths
 DATA_DIR         = os.path.join(_PROJECT_ROOT, "data", "markets")

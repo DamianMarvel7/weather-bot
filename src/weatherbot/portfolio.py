@@ -67,7 +67,9 @@ def load_market(city_slug: str, date_str: str) -> dict | None:
     if not os.path.exists(path):
         return None
     with open(path) as f:
-        return json.load(f)
+        mkt = json.load(f)
+    migrate_positions(mkt)
+    return mkt
 
 
 def save_market(market: dict) -> None:
@@ -83,7 +85,7 @@ def new_market(city_slug: str, date_str: str, event_title: str, hours: float) ->
         "date":               date_str,
         "event":              event_title,
         "status":             "open",
-        "position":           None,
+        "positions":          [],
         "actual_temp":        None,
         "resolved_outcome":   None,
         "pnl":                None,
@@ -92,6 +94,14 @@ def new_market(city_slug: str, date_str: str, event_title: str, hours: float) ->
         "all_outcomes":       [],
         "created_at":         datetime.now(timezone.utc).isoformat(),
     }
+
+
+def migrate_positions(market: dict) -> None:
+    """Convert old single-position format to positions list."""
+    if "positions" in market:
+        return
+    pos = market.pop("position", None)
+    market["positions"] = [pos] if pos else []
 
 
 def append_forecast_snapshot(market: dict, hours_left: float, forecast: dict) -> None:
@@ -272,8 +282,8 @@ class BotState:
         """
         Recalculate balance from market files and fix any discrepancy.
 
-        Computes: INITIAL_BALANCE + sum(pnl for all resolved markets)
-                + sum(size for all still-open positions, since that cash is still deployed)
+        Computes: INITIAL_BALANCE + sum(pnl for all closed positions)
+                - sum(size for all still-open positions, since that cash is still deployed)
 
         Prints a warning if the stored balance differs by more than $0.01.
         """
@@ -282,10 +292,15 @@ class BotState:
         for path in glob.glob(os.path.join(DATA_DIR, "*.json")):
             with open(path) as f:
                 mkt = json.load(f)
-            if mkt.get("pnl") is not None:
+            migrate_positions(mkt)
+            for pos in mkt.get("positions", []):
+                if pos.get("close_reason") is not None and pos.get("pnl") is not None:
+                    resolved_pnl += pos["pnl"]
+                elif pos.get("close_reason") is None:
+                    open_deployed += pos.get("size", 0.0)
+            # Fallback: old-format market-level pnl (no per-position pnl)
+            if not mkt.get("positions") and mkt.get("pnl") is not None:
                 resolved_pnl += mkt["pnl"]
-            elif mkt.get("position") and mkt["position"].get("close_reason") is None:
-                open_deployed += mkt["position"].get("size", 0.0)
 
         correct = round(INITIAL_BALANCE + resolved_pnl - open_deployed, 2)
         if abs(correct - self.balance) > 0.01:
@@ -299,9 +314,9 @@ class BotState:
     def open_position(self, market: dict, outcome: dict,
                       size_dollars: float, ev: float, kelly: float,
                       fill_price: float | None = None) -> None:
-        """Record a new YES position. Entry is at fill_price (defaults to outcome ask)."""
+        """Record a new YES position (one leg of a ladder)."""
         ask = fill_price if fill_price is not None else outcome["ask"]
-        market["position"] = {
+        pos = {
             "bucket":       outcome["label"],
             "token_id":     outcome["token_id"],
             "entry_ask":    ask,
@@ -312,16 +327,16 @@ class BotState:
             "opened_at":    _now_iso(),
             "close_reason": None,
         }
+        market.setdefault("positions", []).append(pos)
         self.balance = round(self.balance - size_dollars, 2)
         print(f"  OPEN  {market['city']} {market['date']} | "
               f"bucket={outcome['label']} ask={ask:.3f} "
               f"size=${size_dollars:.2f} ev={ev:.4f} "
-              f"at={market['position']['opened_at']}")
+              f"at={pos['opened_at']}")
 
-    def close_position(self, market: dict, bid_price: float, reason: str,
-                       detail: dict | None = None) -> None:
-        """Close open position at current bid. Realise P&L."""
-        pos = market["position"]
+    def close_position(self, market: dict, pos: dict, bid_price: float,
+                       reason: str, detail: dict | None = None) -> None:
+        """Close a specific position leg at current bid. Realise P&L."""
         if pos is None:
             return
         proceeds = pos["size"] / pos["entry_ask"] * bid_price
@@ -330,15 +345,18 @@ class BotState:
         pos["close_reason"]  = reason
         pos["close_bid"]     = bid_price
         pos["closed_at"]     = _now_iso()
+        pos["pnl"]           = pnl
         if detail:
             pos["close_detail"] = detail
-        market["pnl"]        = pnl
+        # Market-level pnl = sum of all closed legs
+        closed = [p for p in market.get("positions", []) if p.get("close_reason")]
+        market["pnl"] = round(sum(p.get("pnl", 0) for p in closed), 2)
         print(f"  CLOSE {market['city']} {market['date']} | "
-              f"reason={reason} bid={bid_price:.3f} pnl=${pnl:+.2f} "
-              f"at={pos['closed_at']}")
+              f"bucket={pos['bucket']} reason={reason} bid={bid_price:.3f} "
+              f"pnl=${pnl:+.2f} at={pos['closed_at']}")
 
     @staticmethod
-    def check_stops(market: dict, current_bid: float,
+    def check_stops(market: dict, pos: dict, current_bid: float,
                     forecast_temp: float | None,
                     metar_temp: float | None = None,
                     hours_left: float | None = None,
@@ -351,7 +369,6 @@ class BotState:
           metar_diverge   — hours_left < 12 and METAR observation outside bucket
           forecast_change — forecast moved far outside bought bucket (>1.5σ buffer)
         """
-        pos = market["position"]
         if pos is None:
             return None
 

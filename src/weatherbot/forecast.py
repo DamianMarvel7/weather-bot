@@ -6,6 +6,37 @@ import requests
 
 from .config import LOCATIONS, TIMEZONES, MAX_FORECAST_SPREAD_F, MAX_FORECAST_SPREAD_C
 
+_session = requests.Session()
+
+# ---------------------------------------------------------------------------
+# Per-scan caches — call prefetch_forecasts() / clear_forecast_cache() in bot
+# ---------------------------------------------------------------------------
+
+_forecast_cache: dict[str, dict[str, dict[str, float | None]]] = {}
+_metar_cache: dict[str, float | None] = {}
+
+
+def prefetch_forecasts(city_slugs: list[str], dates: list[str]) -> None:
+    """Batch-fetch forecasts for all cities. One API call per city (all dates)."""
+    _forecast_cache.clear()
+    _metar_cache.clear()
+    for city_slug in city_slugs:
+        loc = LOCATIONS[city_slug]
+        temp_unit = "fahrenheit" if loc["unit"] == "F" else "celsius"
+        if loc["region"] == "us":
+            models = ["gfs_seamless", "ecmwf_ifs025", "gfs_global"]
+        else:
+            models = ["ecmwf_ifs025", "gfs_global", "icon_seamless"]
+        data = _fetch_open_meteo(city_slug, dates, models, temp_unit, forecast_days=7)
+        _forecast_cache[city_slug] = data
+        # Prefetch METAR too
+        _metar_cache[city_slug] = _get_metar_raw(city_slug)
+
+
+def clear_forecast_cache() -> None:
+    _forecast_cache.clear()
+    _metar_cache.clear()
+
 
 def _fetch_open_meteo(city_slug: str, dates: list, models: list[str],
                       temp_unit: str, forecast_days: int) -> dict[str, dict[str, float | None]]:
@@ -24,7 +55,7 @@ def _fetch_open_meteo(city_slug: str, dates: list, models: list[str],
         f"&models={models_str}"
     )
     try:
-        data = requests.get(url, timeout=(5, 10)).json()
+        data = _session.get(url, timeout=(5, 15)).json()
         daily = data.get("daily", {})
         times = daily.get("time", [])
         result: dict[str, dict[str, float | None]] = {d: {} for d in dates}
@@ -39,12 +70,12 @@ def _fetch_open_meteo(city_slug: str, dates: list, models: list[str],
         return {d: {} for d in dates}
 
 
-def get_metar(city_slug: str) -> float | None:
+def _get_metar_raw(city_slug: str) -> float | None:
     """Live ICAO station observation — same station Polymarket uses for resolution."""
     loc = LOCATIONS[city_slug]
     url = f"https://aviationweather.gov/api/data/metar?ids={loc['station']}&format=json"
     try:
-        data = requests.get(url, timeout=(5, 8)).json()
+        data = _session.get(url, timeout=(5, 8)).json()
         if not data:
             return None
         temp_c = data[0].get("temp")
@@ -53,6 +84,13 @@ def get_metar(city_slug: str) -> float | None:
         return round(temp_c * 9 / 5 + 32, 1) if loc["unit"] == "F" else round(float(temp_c), 1)
     except Exception:
         return None
+
+
+def get_metar(city_slug: str) -> float | None:
+    """Return cached METAR if available, otherwise fetch live."""
+    if city_slug in _metar_cache:
+        return _metar_cache[city_slug]
+    return _get_metar_raw(city_slug)
 
 
 def get_best_forecast(city_slug: str, date_str: str, hours_ahead: float) -> dict:
@@ -73,8 +111,12 @@ def get_best_forecast(city_slug: str, date_str: str, hours_ahead: float) -> dict
         models = ["ecmwf_ifs025", "gfs_global", "icon_seamless"]
         forecast_days = 7
 
-    model_data = _fetch_open_meteo(city_slug, [date_str], models, temp_unit, forecast_days)
-    day_data = model_data.get(date_str, {})
+    # Use cached data if available (from prefetch_forecasts), else fetch live
+    if city_slug in _forecast_cache and date_str in _forecast_cache[city_slug]:
+        day_data = _forecast_cache[city_slug][date_str]
+    else:
+        model_data = _fetch_open_meteo(city_slug, [date_str], models, temp_unit, forecast_days)
+        day_data = model_data.get(date_str, {})
 
     # Collect non-None forecasts
     valid_forecasts: dict[str, float] = {}
@@ -82,7 +124,7 @@ def get_best_forecast(city_slug: str, date_str: str, hours_ahead: float) -> dict
         if temp is not None:
             valid_forecasts[model] = temp
 
-    metar = get_metar(city_slug) if hours_ahead <= 24 else None
+    metar = get_metar(city_slug) if hours_ahead <= 30 else None
 
     if not valid_forecasts:
         return {"ecmwf": None, "hrrr": None, "metar": metar,

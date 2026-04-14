@@ -13,13 +13,17 @@ from .config import (
     DATA_DIR, LOCATIONS, VC_KEY,
     MAX_BET, MIN_EV, MAX_EV, MIN_PRICE, MAX_PRICE, MAX_SLIPPAGE, MAX_POSITIONS,
     CITY_BLACKLIST, MAX_FORECAST_SPREAD_F, MAX_FORECAST_SPREAD_C,
+    MAX_LEGS_PER_EVENT, MAX_EXPOSURE_PER_EVENT,
 )
 from .execution import PaperExecutor
-from .forecast import get_best_forecast
-from .polymarket import get_polymarket_event, get_clob_prices, check_gamma_resolved
+from .forecast import get_best_forecast, prefetch_forecasts, clear_forecast_cache
+from .polymarket import (
+    get_polymarket_event, get_clob_prices, check_gamma_resolved,
+    prefetch_events, clear_events_cache,
+)
 from .portfolio import (
     BotState,
-    load_market, save_market, new_market,
+    load_market, save_market, new_market, migrate_positions,
     append_forecast_snapshot, append_market_snapshot,
     load_calibration, run_calibration, get_probability,
     calc_ev, calc_kelly,
@@ -51,16 +55,22 @@ class WeatherBot:
     def scan_and_update(self) -> None:
         """Full hourly scan: forecasts → events → position management."""
         self.calibration = load_calibration()
+        scan_dates = self._scan_dates()
+        active_cities = [c for c in LOCATIONS if c not in CITY_BLACKLIST]
 
-        for city_slug in LOCATIONS:
-            if city_slug in CITY_BLACKLIST:
-                continue
-            for date_str in self._scan_dates():
+        # Batch-prefetch: 1 Gamma call + 1 Open-Meteo call per city + 1 METAR per city
+        prefetch_events()
+        prefetch_forecasts(active_cities, scan_dates)
+
+        for city_slug in active_cities:
+            for date_str in scan_dates:
                 try:
                     self._process_city_date(city_slug, date_str)
                 except Exception as exc:
                     print(f"  ERROR {city_slug} {date_str}: {exc}")
 
+        clear_events_cache()
+        clear_forecast_cache()
         self._auto_resolve_all()
         run_calibration()
         self.state.save()
@@ -75,26 +85,30 @@ class WeatherBot:
                 mkt = json.load(f)
             if mkt.get("status") != "open":
                 continue
-            pos = mkt.get("position")
-            if not pos or pos.get("close_reason") is not None:
-                continue
-            token_id = pos.get("token_id")
-            if not token_id:
-                continue
-            cur_bid, _ = get_clob_prices(token_id)
-            if cur_bid is None:
-                continue
-            stop = BotState.check_stops(mkt, cur_bid, None, calibration=self.calibration)
-            if stop:
-                pos  = mkt.get("position", {})
-                fill = self.executor.exit(token_id, cur_bid)
-                if not fill.filled:
+            migrate_positions(mkt)
+            changed = False
+            for pos in mkt.get("positions", []):
+                if pos.get("close_reason") is not None:
                     continue
-                self.state.close_position(mkt, fill.fill_price, stop)
+                token_id = pos.get("token_id")
+                if not token_id:
+                    continue
+                cur_bid, _ = get_clob_prices(token_id)
+                if cur_bid is None:
+                    continue
+                stop = BotState.check_stops(mkt, pos, cur_bid, None,
+                                            calibration=self.calibration)
+                if stop:
+                    fill = self.executor.exit(token_id, cur_bid)
+                    if not fill.filled:
+                        continue
+                    self.state.close_position(mkt, pos, fill.fill_price, stop)
+                    changed = True
+                    if self.tg:
+                        from .telegram_bot import notify_closed
+                        notify_closed(self.tg, mkt, pos, stop, cur_bid)
+            if changed:
                 save_market(mkt)
-                if self.tg:
-                    from .telegram_bot import notify_closed
-                    notify_closed(self.tg, mkt, pos, stop, cur_bid)
         self.state.save()
 
     # ------------------------------------------------------------------
@@ -107,9 +121,12 @@ class WeatherBot:
         for path in glob.glob(os.path.join(DATA_DIR, "*.json")):
             with open(path) as f:
                 mkt = json.load(f)
-            pos = mkt.get("position")
-            if pos and pos.get("close_reason") is None and mkt.get("status") == "open":
-                open_positions.append((mkt["city"], mkt["date"], pos))
+            migrate_positions(mkt)
+            if mkt.get("status") != "open":
+                continue
+            for pos in mkt.get("positions", []):
+                if pos.get("close_reason") is None:
+                    open_positions.append((mkt["city"], mkt["date"], pos))
 
         print(f"Open positions: {len(open_positions)}")
         for city, date, pos in open_positions:
@@ -147,14 +164,27 @@ class WeatherBot:
         for path in glob.glob(os.path.join(DATA_DIR, "*.json")):
             with open(path) as f:
                 mkt = json.load(f)
-            if mkt.get("status") == "resolved" and mkt.get("pnl") is not None:
-                rows.append(mkt)
+            migrate_positions(mkt)
+            if mkt.get("status") != "resolved":
+                continue
+            for pos in mkt.get("positions", []):
+                if pos.get("close_reason") is None:
+                    continue
+                pnl = pos.get("pnl", 0)
+                rows.append({
+                    "city":             mkt["city"],
+                    "date":             mkt["date"],
+                    "resolved_outcome": mkt.get("resolved_outcome", "-"),
+                    "actual_temp":      mkt.get("actual_temp"),
+                    "pos":              pos,
+                    "pnl":              pnl,
+                })
 
         if not rows:
             print("No resolved markets yet.")
             return
 
-        rows.sort(key=lambda m: (m.get("position") or {}).get("closed_at", m["date"]))
+        rows.sort(key=lambda r: r["pos"].get("closed_at", r["date"]))
         if last_n is not None:
             rows = rows[-last_n:]
 
@@ -162,15 +192,15 @@ class WeatherBot:
         losses    = sum(1 for r in rows if r["pnl"] <= 0)
         total_pnl = sum(r["pnl"] for r in rows)
 
-        label = f"Last {last_n} trades" if last_n is not None else f"Resolved markets: {len(rows)}"
+        label = f"Last {last_n} legs" if last_n is not None else f"Resolved legs: {len(rows)}"
         print(f"\n{label}  W/L: {wins}/{losses}  "
               f"Total P&L: ${total_pnl:+.2f}\n")
         print(f"{'City':<14} {'Mkt Date':<12} {'Our Bucket':<20} {'PM Resolved':<20} {'VC Actual':>10} {'P&L':>8}  {'Reason':<18} {'Close Detail':<30} {'Opened At':<22} Closed At")
         print("-" * 172)
         for r in rows:
-            pos         = r.get("position", {}) or {}
+            pos         = r["pos"]
             bucket      = pos.get("bucket", "-")
-            pm_resolved = r.get("resolved_outcome", "-")
+            pm_resolved = r["resolved_outcome"]
             actual      = f"{r['actual_temp']:.1f}" if r.get("actual_temp") else "-"
             reason      = pos.get("close_reason", "-")
             detail      = WeatherBot._close_detail_str(pos)
@@ -182,19 +212,23 @@ class WeatherBot:
 
     def cmd_scan_dry(self) -> None:
         """
-        Dry-run scan: shows every city/date evaluated and why buckets
-        pass or fail the entry filter. No positions are opened.
+        Dry-run scan: shows every city/date evaluated and which buckets
+        would form the ladder. No positions are opened.
         """
         from .config import MIN_HOURS, MAX_HOURS, MIN_EV, MAX_EV, MIN_PRICE, MAX_PRICE, MAX_SLIPPAGE
         self.calibration = load_calibration()
         today = datetime.now(timezone.utc).date()
         scan_dates = [(today + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(3)]
+        active_cities = [c for c in LOCATIONS if c not in CITY_BLACKLIST]
         open_count = self._count_open_positions()
-        print(f"\nDry-run scan  (open positions: {open_count}/{MAX_POSITIONS})\n")
+        print(f"\nDry-run scan  (open legs: {open_count}/{MAX_POSITIONS}, "
+              f"max {MAX_LEGS_PER_EVENT} legs/event, ${MAX_EXPOSURE_PER_EVENT:.0f} max/event)\n")
 
-        for city_slug in LOCATIONS:
-            if city_slug in CITY_BLACKLIST:
-                continue
+        # Batch-prefetch all data upfront
+        prefetch_events()
+        prefetch_forecasts(active_cities, scan_dates)
+
+        for city_slug in active_cities:
             for date_str in scan_dates:
                 event = get_polymarket_event(city_slug, date_str)
                 if event is None:
@@ -220,6 +254,8 @@ class WeatherBot:
                     print(f"    (all buckets p=0, skipping)")
                     continue
 
+                # Collect candidates for ladder display
+                candidates = []
                 for outcome in event["outcomes"]:
                     ask = outcome.get("ask")
                     bid = outcome.get("bid")
@@ -238,16 +274,26 @@ class WeatherBot:
                         continue
                     p  = raw_probs[label] / total_p
                     ev = calc_ev(p, ask)
-                    flag = ""
-                    if p < 0.05:
-                        flag = f"SKIP  p={p:.3f} < 0.05"
+                    if p < 0.01:
+                        print(f"    {label:<22} SKIP  p={p:.3f} < 0.01")
                     elif ev <= MIN_EV:
-                        flag = f"SKIP  ev={ev:.4f} <= {MIN_EV}"
+                        print(f"    {label:<22} SKIP  ev={ev:.4f} <= {MIN_EV}")
                     elif ev > MAX_EV:
-                        flag = f"SKIP  ev={ev:.4f} > {MAX_EV} (artifact)"
+                        print(f"    {label:<22} SKIP  ev={ev:.4f} > {MAX_EV} (artifact)")
                     else:
-                        flag = f"PASS  p={p:.3f} ev={ev:.4f} ask={ask:.3f}"
-                    print(f"    {label:<22} {flag}")
+                        candidates.append((label, p, ev, ask))
+                        print(f"    {label:<22} CANDIDATE  p={p:.3f} ev={ev:.4f} ask={ask:.3f}")
+
+                # Show which candidates would form the ladder
+                if candidates:
+                    candidates.sort(key=lambda c: c[2], reverse=True)
+                    ladder = candidates[:MAX_LEGS_PER_EVENT]
+                    labels = [c[0] for c in ladder]
+                    total_cost = sum(c[3] for c in ladder)
+                    print(f"    >>> LADDER ({len(ladder)} legs): {', '.join(labels)}")
+
+        clear_events_cache()
+        clear_forecast_cache()
         print()
 
     @staticmethod
@@ -261,23 +307,25 @@ class WeatherBot:
         for path in glob.glob(os.path.join(DATA_DIR, "*.json")):
             with open(path) as f:
                 mkt = json.load(f)
-            pos = mkt.get("position")
-            if not pos or pos.get("close_reason") is None or mkt.get("pnl") is None:
-                continue
-            ev  = pos.get("ev", 0.0)
-            ask = pos.get("entry_ask", 0.5)
-            # p back-calculated from ev = p/ask - 1  →  p = (ev + 1) * ask
-            p_est = min(max((ev + 1) * ask, 0.0), 1.0)
-            rows.append({
-                "city":         mkt["city"],
-                "ev":           ev,
-                "p_est":        p_est,
-                "ask":          ask,
-                "pnl":          mkt["pnl"],
-                "size":         pos.get("size", 0.0),
-                "won":          mkt["pnl"] > 0,
-                "close_reason": pos.get("close_reason", "-"),
-            })
+            migrate_positions(mkt)
+            for pos in mkt.get("positions", []):
+                if pos.get("close_reason") is None:
+                    continue
+                pnl = pos.get("pnl", 0)
+                ev  = pos.get("ev", 0.0)
+                ask = pos.get("entry_ask", 0.5)
+                # p back-calculated from ev = p/ask - 1  →  p = (ev + 1) * ask
+                p_est = min(max((ev + 1) * ask, 0.0), 1.0)
+                rows.append({
+                    "city":         mkt["city"],
+                    "ev":           ev,
+                    "p_est":        p_est,
+                    "ask":          ask,
+                    "pnl":          pnl,
+                    "size":         pos.get("size", 0.0),
+                    "won":          pnl > 0,
+                    "close_reason": pos.get("close_reason", "-"),
+                })
 
         if not rows:
             print("No closed positions yet.")
@@ -299,10 +347,10 @@ class WeatherBot:
                 total_pnl = sum(r["pnl"] for r in br)
                 print(f"{label:<14} {n:>5} {win_pct:>5.0f}% {mean_pnl:>+9.2f}  {mean_ev:>7.1f}% {total_pnl:>+9.2f}")
 
-        # EV calibration
+        # EV calibration (wider buckets for ladder strategy with cheap asks)
         _table(rows,
-               [(0.0, 0.05), (0.05, 0.10), (0.10, 0.20), (0.20, 1.0)],
-               ["0–5%", "5–10%", "10–20%", "20%+"],
+               [(0.0, 0.10), (0.10, 0.50), (0.50, 1.0), (1.0, 5.0)],
+               ["0–10%", "10–50%", "50–100%", "100%+"],
                "ev", "EV Calibration")
 
         # Probability calibration
@@ -405,10 +453,12 @@ class WeatherBot:
         market["resolved_outcome"] = resolved_bucket
         market["actual_temp"]      = self.get_actual_temp_vc(market["city"], market["date"])
 
-        pos = market.get("position")
-        if pos and pos.get("close_reason") is None:
+        migrate_positions(market)
+        for pos in market.get("positions", []):
+            if pos.get("close_reason") is not None:
+                continue
             final_bid = 0.99 if resolved_bucket == pos["bucket"] else 0.01
-            self.state.close_position(market, final_bid, "resolved")
+            self.state.close_position(market, pos, final_bid, "resolved")
             if self.tg:
                 from .telegram_bot import notify_closed
                 notify_closed(self.tg, market, pos, "resolved", final_bid)
@@ -421,6 +471,7 @@ class WeatherBot:
         for path in glob.glob(os.path.join(DATA_DIR, "*.json")):
             with open(path) as f:
                 mkt = json.load(f)
+            migrate_positions(mkt)
             if mkt.get("status") == "open" and self._auto_resolve(mkt):
                 save_market(mkt)
 
@@ -449,60 +500,78 @@ class WeatherBot:
         append_forecast_snapshot(mkt, hours_left, forecast)
         mkt["all_outcomes"] = event["outcomes"]
 
-        pos = mkt.get("position")
-        if pos and pos.get("close_reason") is None:
+        # Check stops on each open leg
+        had_forecast_close = False
+        for pos in list(mkt.get("positions", [])):
+            if pos.get("close_reason") is not None:
+                continue
             token_id = pos.get("token_id")
             cur_bid, cur_ask = get_clob_prices(token_id) if token_id else (None, None)
-            if cur_bid is not None:
-                append_market_snapshot(mkt, hours_left, pos["bucket"],
-                                       cur_bid, cur_ask or cur_bid)
-                stop = BotState.check_stops(mkt, cur_bid, forecast["best"],
-                                            metar_temp=forecast.get("metar"),
-                                            hours_left=hours_left,
-                                            calibration=self.calibration)
-                if stop:
-                    fill = self.executor.exit(pos["token_id"], cur_bid)
-                    if not fill.filled:
-                        return
-                    detail = None
-                    if stop == "forecast_change":
-                        detail = {
-                            "forecast_temp": forecast["best"],
-                            "best_source":   forecast.get("best_source", ""),
-                        }
-                    self.state.close_position(mkt, fill.fill_price, stop, detail=detail)
-                    if self.tg:
-                        from .telegram_bot import notify_closed
-                        notify_closed(self.tg, mkt, pos, stop, cur_bid)
-                    # Don't re-open immediately after a forecast_change close —
-                    # wait for the next scan to avoid paying the spread twice.
-                    if stop == "forecast_change":
-                        save_market(mkt)
-                        return
+            if cur_bid is None:
+                continue
+            append_market_snapshot(mkt, hours_left, pos["bucket"],
+                                   cur_bid, cur_ask or cur_bid)
+            stop = BotState.check_stops(mkt, pos, cur_bid, forecast["best"],
+                                        metar_temp=forecast.get("metar"),
+                                        hours_left=hours_left,
+                                        calibration=self.calibration)
+            if stop:
+                fill = self.executor.exit(pos["token_id"], cur_bid)
+                if not fill.filled:
+                    continue
+                detail = None
+                if stop == "forecast_change":
+                    detail = {
+                        "forecast_temp": forecast["best"],
+                        "best_source":   forecast.get("best_source", ""),
+                    }
+                    had_forecast_close = True
+                self.state.close_position(mkt, pos, fill.fill_price, stop, detail=detail)
+                if self.tg:
+                    from .telegram_bot import notify_closed
+                    notify_closed(self.tg, mkt, pos, stop, cur_bid)
 
-        if mkt.get("position") is None or mkt["position"].get("close_reason") is not None:
+        # Don't re-open immediately after a forecast_change close
+        if had_forecast_close:
+            save_market(mkt)
+            return
+
+        # Open a new ladder if no open positions remain
+        open_legs = [p for p in mkt.get("positions", []) if p.get("close_reason") is None]
+        if not open_legs:
             self._maybe_open(mkt, event, forecast, hours_left)
 
         save_market(mkt)
 
     def _count_open_positions(self) -> int:
-        """Count currently open positions across all market files."""
+        """Count currently open position legs across all market files."""
         count = 0
         for path in glob.glob(os.path.join(DATA_DIR, "*.json")):
             with open(path) as f:
                 mkt = json.load(f)
-            pos = mkt.get("position")
-            if pos and pos.get("close_reason") is None and mkt.get("status") == "open":
-                count += 1
+            if mkt.get("status") != "open":
+                continue
+            migrate_positions(mkt)
+            for pos in mkt.get("positions", []):
+                if pos.get("close_reason") is None:
+                    count += 1
         return count
 
     def _maybe_open(self, market: dict, event: dict, forecast: dict,
                     hours_left: float) -> None:
-        """Evaluate all buckets and open the best-EV position if it clears thresholds."""
-        if self._count_open_positions() >= MAX_POSITIONS:
+        """
+        Ladder strategy: evaluate all buckets and open up to MAX_LEGS_PER_EVENT
+        positive-EV positions, sized so total exposure stays under MAX_EXPOSURE_PER_EVENT.
+
+        Instead of betting big on one bucket, we spread small bets across multiple
+        buckets where our probability estimate exceeds the market price. Most legs
+        expire worthless, but winners at cheap prices (1-10c) pay 10-100x.
+        """
+        open_count = self._count_open_positions()
+        if open_count >= MAX_POSITIONS:
             return
 
-        # Skip when forecast models disagree too much — uncertainty is too high
+        # Skip when forecast models disagree too much
         spread = forecast.get("spread")
         if spread is not None:
             unit = LOCATIONS[market["city"]]["unit"]
@@ -526,11 +595,8 @@ class WeatherBot:
         if total_p <= 0:
             return
 
-        # --- Select best-EV bucket using normalized probabilities ---
-        best_ev     = MIN_EV
-        best_out    = None
-        best_p      = 0.0
-
+        # --- Score all positive-EV buckets ---
+        candidates = []
         for outcome in event["outcomes"]:
             ask = outcome.get("ask")
             bid = outcome.get("bid")
@@ -538,31 +604,58 @@ class WeatherBot:
                 continue
             if bid is not None and (ask - bid) > MAX_SLIPPAGE:
                 continue
-            # Spread-ratio filter: skip if spread > 20% of ask
             if bid is not None and ask > 0 and (ask - bid) / ask > 0.20:
                 continue
 
             p = raw_probs[outcome["label"]] / total_p
-            if p < 0.05:
+            if p < 0.01:
                 continue
             ev = calc_ev(p, ask)
-            if ev > best_ev and ev <= MAX_EV:
-                best_ev, best_out, best_p = ev, outcome, p
+            if ev > MIN_EV and ev <= MAX_EV:
+                kelly = calc_kelly(p, ask)
+                candidates.append({
+                    "outcome": outcome,
+                    "p":       p,
+                    "ev":      ev,
+                    "kelly":   kelly,
+                })
 
-        if best_out is None:
+        if not candidates:
             return
 
-        kelly_frac   = calc_kelly(best_p, best_out["ask"])
-        size_dollars = min(kelly_frac * balance, MAX_BET)
-        if size_dollars < 1.0 or size_dollars > balance:
+        # --- Sort by EV descending, take top N legs ---
+        candidates.sort(key=lambda c: c["ev"], reverse=True)
+        available_slots = MAX_POSITIONS - open_count
+        max_legs = min(MAX_LEGS_PER_EVENT, available_slots, len(candidates))
+        legs = candidates[:max_legs]
+
+        # --- Size each leg with Kelly, then scale to fit exposure cap ---
+        raw_sizes = []
+        for leg in legs:
+            size = min(leg["kelly"] * balance, MAX_BET)
+            raw_sizes.append(max(size, 0.0))
+
+        total_raw = sum(raw_sizes)
+        if total_raw <= 0:
             return
 
-        fill = self.executor.enter(best_out["token_id"], best_out["ask"], best_out.get("bid"))
-        if not fill.filled:
-            return
+        # Scale down if total exceeds max exposure per event
+        if total_raw > MAX_EXPOSURE_PER_EVENT:
+            scale = MAX_EXPOSURE_PER_EVENT / total_raw
+            raw_sizes = [s * scale for s in raw_sizes]
 
-        self.state.open_position(market, best_out, size_dollars, best_ev, kelly_frac,
-                                 fill_price=fill.fill_price)
-        if self.tg:
-            from .telegram_bot import notify_opened
-            notify_opened(self.tg, market, market["position"])
+        # --- Open each leg ---
+        for i, leg in enumerate(legs):
+            size = round(raw_sizes[i], 2)
+            if size < 1.0 or size > self.state.balance:
+                continue
+            outcome = leg["outcome"]
+            fill = self.executor.enter(outcome["token_id"], outcome["ask"],
+                                       outcome.get("bid"))
+            if not fill.filled:
+                continue
+            self.state.open_position(market, outcome, size, leg["ev"], leg["kelly"],
+                                     fill_price=fill.fill_price)
+            if self.tg:
+                from .telegram_bot import notify_opened
+                notify_opened(self.tg, market, market["positions"][-1])

@@ -256,7 +256,7 @@ def notify_closed(tg: TelegramNotifier, market: dict, pos: dict,
     date  = market.get("date", "")
     size  = pos.get("size", 0)
     entry = pos.get("entry_ask", 1)
-    pnl   = market.get("pnl")
+    pnl   = pos.get("pnl") or market.get("pnl")
 
     if pnl is None:
         # Estimate from exit price
