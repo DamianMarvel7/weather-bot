@@ -19,3 +19,18 @@ Churn bug caused same market to be re-entered in same scan after forecast_change
 
 ## [2026-04-05] config | Revert max_positions 4→10, high-volume jackpot strategy
 Accept most trades lose; run enough volume so one large win covers all cumulative losses. → See [[bot_changes/2026-04-05_revert_max_positions_to_10]]
+
+## [2026-04-09] model | Probability model overhaul — fix sigma, remove stop-loss, add ensemble
+Root cause: sigma = MAE * 1.8 was overconfident (inflated 44% beyond correct conversion), causing phantom EV on all tail buckets. Stop-loss had 0% win rate on 60 exits — all would have recovered. Calibration was circular (trained on Polymarket's own bucket midpoints). → See [[bot_changes/2026-04-09_probability_model_overhaul]]
+
+## [2026-04-09] insight | sigma should be std of forecast errors, not MAE * multiplier
+→ See [[insights/probability_model_was_overconfident]]
+
+## [2026-04-09] insight | Hold-to-resolution is correct strategy for weather markets
+→ See [[insights/hold_to_resolution_strategy]]
+
+## [2026-04-14] model | Implement ladder strategy — multi-bucket cheap entries
+Switched from single best-EV bucket ($20 at 15-45c) to ladder of up to 5 cheap buckets ($15 total at 1-50c). Matches strategy used by profitable PM weather traders. Data model changed from `position` to `positions` list. → See [[bot_changes/2026-04-14_ladder_strategy]]
+
+## [2026-04-14] insight | Laddering beats single-bucket betting in weather markets
+Research into neobrother, HondaCivic, ColdMath etc. shows they all ladder 3-5 cheap buckets. 10-20% win rate at 20-100x payout beats 50-60% win rate at 3-6x. → See [[insights/ladder_beats_single_bucket]]

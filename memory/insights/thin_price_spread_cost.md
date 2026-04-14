@@ -1,23 +1,27 @@
 ---
-date: 2026-04-05
+date: 2026-04-14
 type: insight
-tags: [execution, spread-cost, entry-filter]
+tags: [execution, spread-cost, entry-filter, ladder]
 ---
 
-# Insight: Thin-Price Entries Destroy Edge via Spread Cost
+# Insight: Thin-Price Spread Cost — Reframed by Ladder Strategy
 
-## Finding
-With `min_price=0.05`, the bot was entering buckets priced at 5-8 cents. Bid-ask spread at these prices is typically 2-4 cents, meaning 40-60% of entry price is immediately lost to spread on any exit. No EV calculation can survive this cost structure.
+## Finding (Original — 2026-04-05)
+With the old single-bucket strategy, entries at 5-8c had 40-60% spread cost, destroying any EV edge. This led to raising min_price to 0.12.
 
-## Why It Matters
-EV is calculated on mid-price. But execution happens at the ask (entry) and bid (exit). At thin prices, this gap is proportionally enormous. A bucket at 6¢ mid with a 3¢ spread needs to move to ~9¢ just to break even on exit — before any resolution gain.
+## Finding (Updated — 2026-04-14)
+With **laddering**, thin prices are the whole point. When you buy at 1-5c and hold to resolution, spread cost is irrelevant because you never exit early — the position resolves to $1.00 or $0.00. The 142x payout on a 0.7c winner more than covers the 3-5 losers that go to zero.
 
-## Action Taken
-- 2026-04-05: `min_price` raised from 0.05 → 0.12
-- This means we only trade buckets where the spread is a smaller fraction of entry price
+## Why the Old Rule Was Wrong for Laddering
+The old analysis assumed mid-market exit. Ladder legs are **hold-to-resolution** — you never sell back into the spread. The only "cost" is the leg expiring worthless, which is priced into the strategy (most legs lose, one winner covers all).
 
-## Rule of Thumb
-Avoid any bucket where estimated bid-ask spread > 15% of entry price. At `min_price=0.12` and typical 2-4¢ spreads, spread cost is ~17-33% — still high, so this threshold may need to go higher.
+## Current Filters
+- `min_price`: 0.01 (allow very cheap buckets)
+- `max_slippage`: 0.03 (absolute spread cap still applies — protects against illiquid books)
+- Spread-ratio filter: skip if `(ask - bid) / ask > 0.20` (still active, catches extreme cases)
+
+## Rule of Thumb (Revised)
+For hold-to-resolution strategies, **absolute spread** matters more than **spread ratio**. A 3c spread on a 5c bucket is fine if you're holding to resolution. A 3c spread on a 30c bucket matters more because you might exit early on forecast_change.
 
 ## Open Question
-Can we fetch the actual order book depth before entering, and only enter when the spread is below a threshold? Would require CLOB API order book endpoint.
+Track ladder leg outcomes: what's the actual win rate on sub-5c entries? If it's systematically below the model's probability estimate, the cheap buckets may be correctly priced by the market.
